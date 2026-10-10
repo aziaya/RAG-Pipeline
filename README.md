@@ -1,7 +1,24 @@
 # RAG Spark
 
+Blazing-fast High-performance RAG pipeline in Rust — **CLI + HTTP API**.  
+Document ingestion, hybrid search, and local LLM chat with a live TUI.
+## Interfaces
+RAG Spark ships with two first-class interfaces that share the same core pipeline:
 
-Blazing fast High-performance RAG in pure Rust. Ingest documents, hybrid retrieve, and chat with local models
+| Interface | How to use | Best for |
+|-----------|------------|----------|
+| **CLI** | `cargo run --release -- <command>` | Scripting, one-off ingest/search/chat, automation |
+| **HTTP API** | `cargo run --release -- serve` then hit `/ingest`, `/search`, `/chat` | Integration with other services, frontends, agents |
+
+- **CLI modes**
+    - Split-pane TUI (default) — live metrics, trace, and multi-screen workflow
+    - Classic single-pane UI
+    - Direct commands: `ingest`, `search`, `chat`
+- **API**
+    - OpenAPI / Swagger UI at `/docs`
+    - Endpoints: `POST /ingest`, `POST /search`, `POST /chat`, `GET /health`
+
+Both interfaces talk to the same Weaviate index and the same embedding + chat models.
 
 Ingestion, hybrid retrieval and chat over your documents:  
 **docling.rs** (extract + token-aware chunking) → **EmbeddingGemma 2** (OpenAI-compatible endpoint) → **Weaviate** (bring-your-own vectors) → answers from a local chat model (llama-server).
