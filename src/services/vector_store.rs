@@ -2,44 +2,22 @@
 //! official clients are Python, JS/TS, Java, C# and Go). Vectors are supplied by us
 //! (`vectorizer: none`), so Weaviate only stores and searches them.
 
-use crate::config::Config;
+use crate::{
+    config::Config,
+    models::{document::NewChunk, search::Hit},
+};
 use anyhow::{anyhow, Context, Result};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+use tracing::{debug, info_span, Instrument};
 use uuid::Uuid;
 
 pub const CLASS: &str = "DocChunk";
 
-#[derive(Debug, Clone)]
-pub struct NewChunk {
-    pub text: String,
-    pub context_text: String,
-    pub headings: Vec<String>,
-    pub item_refs: Vec<String>,
-    pub chunk_index: usize,
-    pub vector: Vec<f32>,
-}
-
-#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
-pub struct Hit {
-    pub id: Option<String>,
-    pub score: Option<f64>,
-    pub text: String,
-    pub headings: Vec<String>,
-    pub source: String,
-    pub chunk_index: i64,
-}
-
 #[derive(Clone)]
-pub struct Store {
+pub struct VectorStore {
     http: reqwest::Client,
     base: String,
     api_key: Option<String>,
-}
-
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
 }
 
 /// Deterministic object id: re-ingesting identical content overwrites instead of duplicating.
@@ -48,7 +26,7 @@ fn object_id(source: &str, doc_hash: &str, chunk_index: usize) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes())
 }
 
-impl Store {
+impl VectorStore {
     pub fn new(cfg: &Config, http: reqwest::Client) -> Self {
         Self { http, base: cfg.weaviate_url.clone(), api_key: cfg.weaviate_api_key.clone() }
     }
@@ -98,19 +76,24 @@ impl Store {
     }
 
     async fn graphql(&self, query: &str) -> Result<Value> {
-        let resp = self
-            .req(reqwest::Method::POST, "/v1/graphql")
-            .json(&json!({ "query": query }))
-            .send()
-            .await
-            .context("graphql request")?;
-        let v = Self::check(resp, "graphql").await?;
-        if let Some(errs) = v.get("errors") {
-            if !errs.is_null() {
-                return Err(anyhow!("weaviate graphql errors: {errs}"));
+        async {
+            let resp = self
+                .req(reqwest::Method::POST, "/v1/graphql")
+                .json(&json!({ "query": query }))
+                .send()
+                .await
+                .context("graphql request")?;
+            let v = Self::check(resp, "graphql").await?;
+            if let Some(errs) = v.get("errors") {
+                if !errs.is_null() {
+                    return Err(anyhow!("weaviate graphql errors: {errs}"));
+                }
             }
+            debug!("weaviate graphql ok");
+            Ok(v)
         }
-        Ok(v)
+        .instrument(info_span!("weaviate_query"))
+        .await
     }
 
     /// Weaviate readiness probe.
@@ -278,10 +261,6 @@ fn to_graphql_input(v: &Value) -> String {
         other => other.to_string(),
     }
 }
-
-#[derive(Deserialize)]
-#[allow(dead_code)]
-struct Unused;
 
 #[cfg(test)]
 mod tests {

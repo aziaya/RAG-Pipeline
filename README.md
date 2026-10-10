@@ -1,73 +1,114 @@
 # rag-pipeline
 
-Rust ingestion + hybrid retrieval: **docling.rs** (extract + token-aware HybridChunker)
--> **EmbeddingGemma 2** (via an OpenAI-compatible endpoint) -> **Weaviate** (bring-your-own vectors).
+Rust ingestion, hybrid retrieval and chat over your documents:  
+**docling.rs** (extract + token-aware chunking) → **EmbeddingGemma 2** (OpenAI-compatible endpoint) → **Weaviate** (bring-your-own vectors) → answers from a local chat model (llama-server).
 
 ```
-file -> sha256 -> unchanged? skip
-     -> docling.rs convert -> HybridChunker (tokenizer.json of the embedding model)
-     -> embed (context text = heading path + chunk) -> delete old chunks of that source -> batch insert
-search: embed query -> Weaviate hybrid (BM25 + vector, alpha) -> hits
+file → sha256 → unchanged? skip
+→ docling.rs convert → HybridChunker (tokenizer.json of the embedding model)
+→ embed (heading path + chunk) → replace the document's chunks → Weaviate
+question → embed → Weaviate hybrid search (BM25 + vector, alpha) → top chunks → chat model → answer + sources
+```
+
+## Project layout
+
+```
+src/
+main.rs               bootstrap: env, logging mode, services, dispatch
+config.rs             environment configuration
+context.rs            AppContext: wires the services once, cheap to clone
+util.rs               path / text helpers
+models/               plain data types (chat, document, health, search)
+services/             business logic and clients
+extractor.rs          docling.rs extraction + chunking (the only docling touchpoint)
+embedder.rs           embeddings client
+vector_store.rs       Weaviate over REST + GraphQL
+llm.rs                chat-model client and prompt building
+pipeline.rs           ingestion orchestration
+rag.rs                retrieve + answer (shared by API, TUI and CLI)
+health.rs             readiness checks
+api/                  HTTP layer
+mod.rs                router + OpenAPI / Swagger UI
+state.rs  error.rs  dto.rs
+handlers/             one file per endpoint: health, ingest, search, chat
+cli/                  command-line entry points
+mod.rs                clap definitions + dispatch
+commands.rs           ingest, search, serve
+plain_chat.rs         script-friendly chat
+classic.rs            single-pane prompt-and-menu UI
+observability/        tracing layer, event types, metrics registry
+tui/                  split-pane terminal UI
+app.rs  ui.rs  input.rs  markdown.rs  theme.rs  widgets.rs
+screens/              chat, ingest, search, docs, status
+obs/                  in-flight operations, metrics, live trace log
 ```
 
 ## Setup
 
 1. Rust **1.92+** (docling 1.103 requires it).
 2. `docker compose up -d` (Weaviate on :8080). Bump `WEAVIATE_VERSION` to a current release.
-3. Serve EmbeddingGemma 2 behind an OpenAI-compatible `/v1/embeddings` endpoint (Ollama, vLLM, llama.cpp server...).
-   Set `EMBED_BASE_URL` / `EMBED_MODEL`.
-4. Download `tokenizer.json` from the **google/embeddinggemma-2** repo (not the 300m one) to
-   `models/embeddinggemma-2/tokenizer.json`. If the repo does not ship one, see "Open items".
-5. `cp .env.example .env` and fill in `EMBED_DOC_PREFIX` / `EMBED_QUERY_PREFIX` from the model card.
-6. Use bfloat16/float32 when serving the model (the model card says activations exceed float16 range).
-
-## Interactive terminal UI
-
-Run with no command in a terminal:
-
-```
-cargo run --release
-```
-
-A menu (arrow keys, Enter, Esc) offers: chat, search, ingest, browse/manage documents, and a system status screen
-that checks Weaviate, the embedding server, the chat server, the tokenizer file and ONNX Runtime.
-Ingesting shows an overall progress bar, a live stage line (extracting, embedding n/m chunks, writing) and a
-summary table. Inside chat: `/source` (pick a document), `/show N`, `/alpha`, `/limit`, `/clear`, `/exit`; Up/Down
-recall earlier questions. Documents ingested from the terminal are identified by their full path; uploads through
-`/ingest` are identified by filename.
+3. Serve the embedding model and a chat model with llama-server (or any OpenAI-compatible server) and set  
+   `EMBED_*` / `CHAT_*` in `.env`.
+4. Download `tokenizer.json` from the **google/embeddinggemma-2** repo and set `CHUNK_TOKENIZER` to its absolute path.
+5. `cp .env.example .env`. Values containing spaces or `|` (the task prefixes) **must be quoted**.
+6. For PDFs and images export `ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib` (docling uses `ort-load-dynamic`).
 
 ## Run
 
-Swagger UI is at **http://localhost:3000/docs** (OpenAPI JSON at `/openapi.json`); `/` redirects to it.
-`serve` starts even if Weaviate is unreachable (it logs a warning and retries on `/ingest`).
-PDFs need ONNX Runtime at runtime when docling's `ort-load-dynamic` feature is on:
-`export ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib` (or `.so`).
-
-```
-cargo run --release -- ingest ./docs          # file or directory, recursive
-cargo run --release -- search "what is the notice period?" --limit 5 --alpha 0.5
-cargo run --release -- serve                   # HTTP API
-cargo run --release -- chat                    # interactive chat in the terminal
-cargo run --release -- chat "what is kokoro"   # one question, then exit
+```bash
+cargo run --release                  # split-pane UI with live tracing (the default)
+cargo run --release -- classic       # single-pane prompt-and-menu UI
+cargo run --release -- serve         # HTTP API, Swagger UI at /docs
+cargo run --release -- ingest ./docs
+cargo run --release -- search "question"
+cargo run --release -- chat "question"
 ```
 
-`POST /chat` retrieves with hybrid search, then asks the chat model (llama-server on CHAT_BASE_URL) to answer from the chunks, returning the answer plus numbered sources. For Gemma 4 start the chat server with `--jinja --chat-template-kwargs '{"enable_thinking":false}'`.
+## The split-pane UI
 
+The active screen (Chat, Ingest, Search, Docs, Status) is on the left; observability is on the right  
+(or underneath on narrow terminals) and updates live while a question or an ingestion runs:
+
+- **In flight**: every running operation (`ingest_file`, `extract`, `embed_batch`, `weaviate_write`, `search`, `llm_generate`) with its elapsed time.
+- **Metrics**: files indexed / skipped / failed, chunks, embeddings, searches, chats, errors, LLM tokens and tok/s, and last / average / p95 latency per operation with a small trend chart.
+- **Trace**: a timestamped, color-coded log of tracing events and span timings.
+
+Keys: `Esc` leaves the text field (NAV mode), `i`/`Enter` types again, `1`-`5` / `h` `l` switch screens, `Tab` focuses the trace pane, `v` verbosity (INFO/DEBUG/TRACE), `p` pause, `X` clear, `L` layout (right / bottom / hidden), `?` help, `q` or `Ctrl-C` quit. Chat has slash-commands (`/help`). Set `RAG_LOG_FILE` to also write the trace to a file.
+
+### Ingest screen
+
+![Ingest screen](docs/screenshots/tui-ingest.png)
+
+### Search screen
+
+![Search screen](docs/screenshots/tui-search.png)
+
+### Docs screen
+
+![Docs screen](docs/screenshots/tui-docs.png)
+
+### Status screen
+
+![Status screen](docs/screenshots/tui-status.png)
+
+### Chat screen
+
+![Chat screen](docs/screenshots/tui-chat.png)
+
+![Chat with sources expanded](docs/screenshots/tui-chat-source.png)
+
+## API
+
+`POST /ingest` (multipart `file`), `POST /search`, `POST /chat`, `GET /health`; Swagger UI at `/docs`.
+
+![Swagger UI overview](docs/screenshots/swagger-overview.png)
+
+![Chat endpoint in Swagger](docs/screenshots/swagger-chat.png)
+
+## Notes
+
+- Weaviate is queried over REST + GraphQL (there is no official Rust client).
+- Documents ingested from the terminal are identified by their full path; uploads through `/ingest` by filename.
+- Ingestion embeds before it deletes a document's old chunks, but delete + insert is not atomic.
+- Without the `docling` feature only `.txt`, `.md` and `.csv` can be read.
 ```
-curl -F file=@report.pdf http://localhost:3000/ingest
-curl -X POST http://localhost:3000/search -H 'content-type: application/json' \
-     -d '{"query":"termination clause","limit":5,"alpha":0.5}'
-```
-
-## Open items (verify on your side)
-
-- **Tokenizer file**: I could not confirm `tokenizer.json` ships in the embeddinggemma-2 repo. Check the Files tab.
-- **Prefixes**: exact task-prefix strings come from the model card; they are left empty in `.env.example`.
-- **Max input length** of the model: check the card; keep `CHUNK_MAX_TOKENS` well below it.
-- **Sandbox verification**: the project was compile-checked and unit-tested here with Rust 1.91
-  (`--ignore-rust-version`), with docling built **without** its ONNX/PDF features because the sandbox could not
-  download ONNX Runtime. So the docling API calls (convert, HybridChunker, contextualize) are verified
-  to compile against 1.103.0, but PDF/OCR/audio runtime behavior and the Weaviate/embedding calls
-  against live services are **not** tested. Run the 10-20 mixed-file inspection before trusting it.
-- Weaviate is queried via REST + GraphQL (no official Rust client).
-- Ingestion deletes a source's old chunks only after the new ones are embedded, but delete + insert is not atomic.

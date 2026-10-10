@@ -2,24 +2,21 @@
 //! (llama-server, Ollama, vLLM, ...). Retrieval happens elsewhere; this module only
 //! builds the prompt from retrieved chunks and calls the model.
 
-use crate::{config::Config, store::Hit};
+use crate::{
+    config::Config,
+    models::{chat::ChatTurn, search::Hit},
+    observability::metrics::metrics,
+};
 use anyhow::{anyhow, Context, Result};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
+use tracing::{info, info_span, Instrument};
 
 const MAX_HISTORY_TURNS: usize = 8;
 const MAX_TURN_CHARS: usize = 2000;
 
-#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
-pub struct ChatTurn {
-    /// "user" or "assistant"
-    pub role: String,
-    pub content: String,
-}
-
 #[derive(Clone)]
-pub struct ChatClient {
+pub struct LlmClient {
     http: reqwest::Client,
     base_url: String,
     model: String,
@@ -31,7 +28,7 @@ pub struct ChatClient {
     context_chars: usize,
 }
 
-impl ChatClient {
+impl LlmClient {
     pub fn new(cfg: &Config, http: reqwest::Client) -> Self {
         Self {
             http,
@@ -61,7 +58,13 @@ impl ChatClient {
 
     /// Returns the answer and how many of the retrieved chunks fit in the prompt.
     pub async fn answer(&self, question: &str, history: &[ChatTurn], hits: &[Hit]) -> Result<(String, usize)> {
+        let span = info_span!("llm_generate", chunks = hits.len(), model = %self.model);
+        self.answer_inner(question, history, hits).instrument(span).await
+    }
+
+    async fn answer_inner(&self, question: &str, history: &[ChatTurn], hits: &[Hit]) -> Result<(String, usize)> {
         let (prompt, used) = build_prompt(question, hits, self.context_chars);
+        info!(prompt_chars = prompt.len(), passages = used, history_turns = history.len(), "llm request");
 
         // Prior turns first; the instructions + context ride in the final user message.
         // (No system role: some Gemma 4 chat templates switch on a reasoning trace when
@@ -107,6 +110,13 @@ impl ChatClient {
         }
         let v: Value = serde_json::from_str(&text).context("bad chat response")?;
         let content = v["choices"][0]["message"]["content"].as_str().unwrap_or("").trim().to_string();
+        let completion_tokens = v["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+        let tok_per_s = v["timings"]["predicted_per_second"].as_f64();
+        metrics().inc(&metrics().llm_tokens, completion_tokens);
+        if let Some(t) = tok_per_s {
+            metrics().set_llm_rate(t);
+        }
+        info!(completion_tokens, tok_per_s = tok_per_s.map(|t| format!("{t:.1}")).unwrap_or_else(|| "n/a".into()), "llm responded");
         if content.is_empty() {
             return Err(anyhow!(
                 "model returned no answer text (a reasoning trace may have used all {} tokens; \

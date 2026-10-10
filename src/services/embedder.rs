@@ -1,9 +1,10 @@
 //! Embeddings via any OpenAI-compatible `/embeddings` endpoint.
 
-use crate::config::Config;
+use crate::{config::Config, observability::metrics::metrics};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::json;
+use tracing::{debug, info_span, warn, Instrument};
 
 #[derive(Clone)]
 pub struct Embedder {
@@ -44,25 +45,34 @@ impl Embedder {
 
     async fn embed_raw(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>> {
         let n = inputs.len();
-        let mut req = self
-            .http
-            .post(format!("{}/embeddings", self.base_url))
-            .json(&json!({ "model": self.model, "input": inputs }));
-        if let Some(k) = &self.api_key {
-            req = req.bearer_auth(k);
+        let span = info_span!("embed_batch", inputs = n, model = %self.model);
+        async move {
+            let mut req = self
+                .http
+                .post(format!("{}/embeddings", self.base_url))
+                .json(&json!({ "model": self.model, "input": inputs }));
+            if let Some(k) = &self.api_key {
+                req = req.bearer_auth(k);
+            }
+            let resp = req.send().await.context("embedding request failed")?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                warn!(%status, "embedding endpoint rejected the batch");
+                return Err(anyhow!("embedding endpoint returned {status}: {body}"));
+            }
+            let mut parsed: EmbResponse = resp.json().await.context("bad embedding response")?;
+            if parsed.data.len() != n {
+                return Err(anyhow!("expected {n} embeddings, got {}", parsed.data.len()));
+            }
+            parsed.data.sort_by_key(|d| d.index);
+            let dims = parsed.data.first().map(|d| d.embedding.len()).unwrap_or(0);
+            metrics().inc(&metrics().embeddings, n as u64);
+            debug!(inputs = n, dims, "embedding batch ok");
+            Ok(parsed.data.into_iter().map(|d| d.embedding).collect())
         }
-        let resp = req.send().await.context("embedding request failed")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("embedding endpoint returned {status}: {body}"));
-        }
-        let mut parsed: EmbResponse = resp.json().await.context("bad embedding response")?;
-        if parsed.data.len() != n {
-            return Err(anyhow!("expected {n} embeddings, got {}", parsed.data.len()));
-        }
-        parsed.data.sort_by_key(|d| d.index);
-        Ok(parsed.data.into_iter().map(|d| d.embedding).collect())
+        .instrument(span)
+        .await
     }
 
     /// Embed document chunks (applies the document task prefix), reporting (done, total)

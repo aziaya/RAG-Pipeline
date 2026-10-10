@@ -2,19 +2,9 @@
 //! This is the only module that touches docling, so it can be swapped for the
 //! docling-serve (Python) sidecar later without changing the rest of the pipeline.
 
+use crate::models::document::RawChunk;
 use anyhow::Result;
 use std::path::Path;
-
-/// Our own chunk type: the rest of the pipeline never sees docling types.
-#[derive(Debug, Clone)]
-pub struct RawChunk {
-    /// Chunk text as produced by the chunker.
-    pub text: String,
-    /// Heading path + chunk text. This is what gets embedded and BM25-indexed.
-    pub context_text: String,
-    pub headings: Vec<String>,
-    pub item_refs: Vec<String>,
-}
 
 #[cfg(feature = "docling")]
 pub fn extract_and_chunk(path: &Path, tokenizer: &Path, max_tokens: usize) -> Result<Vec<RawChunk>> {

@@ -1,12 +1,16 @@
-//! Interactive terminal interface: menus, prompts, spinners, progress bars, tables and a
-//! colored chat view. Everything here is presentation; the work is done by `Pipeline`,
-//! `ChatClient` and `Store`.
+//! Prompt-and-menu terminal interface (single pane): menus, prompts, spinners, progress
+//! bars, tables and a colored chat view. Presentation only; the work is done by the services.
 
 use crate::{
-    api,
-    chat::{ChatClient, ChatTurn},
-    pipeline::{IngestOutcome, Pipeline, Stage},
-    store::Hit,
+    context::AppContext,
+    models::{
+        chat::{ChatTurn, RagStage, SourceRef},
+        document::{IngestOutcome, Stage},
+        health::Level,
+        search::Hit,
+    },
+    services::{health, pipeline::Pipeline},
+    util::{clean_path, collect_files, score_bar, short, trunc},
 };
 use anyhow::Result;
 use comfy_table::{presets::UTF8_FULL, Cell, Color, ContentArrangement, Table};
@@ -14,11 +18,10 @@ use console::{style, Term};
 use dialoguer::{theme::ColorfulTheme, BasicHistory, Completion, Confirm, FuzzySelect, Input, MultiSelect, Select};
 use indicatif::{HumanDuration, MultiProgress, ProgressBar, ProgressStyle};
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 use termimad::MadSkin;
-use walkdir::WalkDir;
 
 pub struct ChatOpts {
     pub limit: usize,
@@ -42,34 +45,6 @@ fn spinner(msg: &str) -> ProgressBar {
     sp.set_message(msg.to_string());
     sp.enable_steady_tick(Duration::from_millis(90));
     sp
-}
-
-fn short(source: &str) -> String {
-    Path::new(source)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(String::from)
-        .unwrap_or_else(|| source.to_string())
-}
-
-/// Collapse whitespace and cut to `n` characters.
-fn trunc(s: &str, n: usize) -> String {
-    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= n {
-        flat
-    } else {
-        format!("{}…", flat.chars().take(n.saturating_sub(1)).collect::<String>())
-    }
-}
-
-fn score_bar(score: Option<f64>) -> String {
-    match score {
-        Some(sc) => {
-            let n = (sc.clamp(0.0, 1.0) * 8.0).round() as usize;
-            format!("{}{} {:.2}", "█".repeat(n), "░".repeat(8 - n), sc)
-        }
-        None => String::new(),
-    }
 }
 
 /// Wrap citation markers like [1] in bold so the markdown renderer highlights them.
@@ -103,70 +78,12 @@ fn skin() -> MadSkin {
     skin
 }
 
-/// Turn what a user typed or dragged into the terminal into a real path.
-fn clean_path(input: &str) -> PathBuf {
-    let mut s = input.trim().to_string();
-    if (s.starts_with('\'') && s.ends_with('\'') || s.starts_with('"') && s.ends_with('"')) && s.len() >= 2 {
-        s = s[1..s.len() - 1].to_string();
-    }
-    s = s.replace("\\ ", " ");
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(s)
-}
-
-/// Files under `path` (or `path` itself), skipping hidden files and folders.
-pub fn collect_files(path: &Path) -> Vec<PathBuf> {
-    if path.is_file() {
-        return vec![path.to_path_buf()];
-    }
-    let mut files: Vec<PathBuf> = WalkDir::new(path)
-        .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.into_path())
-        .collect();
-    files.sort();
-    files
-}
-
 /// Tab-completion for filesystem paths in the ingest prompt.
 struct PathCompletion;
 
 impl Completion for PathCompletion {
     fn get(&self, input: &str) -> Option<String> {
-        let typed = clean_path(input);
-        let (dir, prefix) = if input.ends_with('/') {
-            (typed.clone(), String::new())
-        } else {
-            (
-                typed.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(".")),
-                typed.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-            )
-        };
-        let dir = if dir.as_os_str().is_empty() { PathBuf::from(".") } else { dir };
-        let mut names: Vec<(String, bool)> = std::fs::read_dir(&dir)
-            .ok()?
-            .filter_map(|e| e.ok())
-            .filter_map(|e| Some((e.file_name().to_str()?.to_string(), e.path().is_dir())))
-            .filter(|(n, _)| n.starts_with(&prefix) && (prefix.starts_with('.') || !n.starts_with('.')))
-            .collect();
-        names.sort();
-        let first = names.first()?.clone();
-        // Longest common prefix of all matches
-        let mut common = first.0.clone();
-        for (n, _) in &names {
-            while !n.starts_with(&common) {
-                common.pop();
-            }
-        }
-        let completed = if names.len() == 1 && first.1 { format!("{common}/") } else { common };
-        let base = input.rsplit_once('/').map(|(b, _)| format!("{b}/")).unwrap_or_default();
-        Some(format!("{base}{completed}"))
+        crate::util::complete_path(input)
     }
 }
 
@@ -208,7 +125,8 @@ fn hits_table(hits: &[Hit]) -> Table {
 
 // ───────────────────────────── main menu ─────────────────────────────
 
-pub async fn run_menu(p: &Pipeline, chat: &ChatClient) -> Result<()> {
+pub async fn run_menu(ctx: &AppContext) -> Result<()> {
+    let p = &ctx.pipeline;
     let items = [
         "Chat with your documents",
         "Search your documents",
@@ -226,17 +144,12 @@ pub async fn run_menu(p: &Pipeline, chat: &ChatClient) -> Result<()> {
             .interact_opt()?;
         let result = match choice {
             Some(0) => {
-                chat_session(
-                    p,
-                    chat,
-                    ChatOpts { limit: p.cfg.chat_top_k, alpha: 0.5, source: None },
-                )
-                .await
+                chat_session(ctx, ChatOpts { limit: p.cfg.chat_top_k, alpha: 0.5, source: None }).await
             }
-            Some(1) => search_flow(p).await,
+            Some(1) => search_flow(ctx).await,
             Some(2) => ingest_flow(p).await,
-            Some(3) => browse_flow(p, chat).await,
-            Some(4) => status(p, chat).await,
+            Some(3) => browse_flow(ctx).await,
+            Some(4) => status(ctx).await,
             _ => break,
         };
         match result {
@@ -404,7 +317,7 @@ pub async fn ingest_paths(p: &Pipeline, files: Vec<PathBuf>) -> Result<()> {
 
 // ───────────────────────────── search ─────────────────────────────
 
-async fn search_flow(p: &Pipeline) -> Result<()> {
+async fn search_flow(ctx: &AppContext) -> Result<()> {
     let th = theme();
     let mode = Select::with_theme(&th)
         .with_prompt("Search mode")
@@ -432,7 +345,7 @@ async fn search_flow(p: &Pipeline) -> Result<()> {
             return Ok(());
         }
         let sp = spinner("Embedding the query and searching Weaviate…");
-        let res = api::run_search(p, q.trim(), 8, alpha, None).await;
+        let res = ctx.rag.search(q.trim(), 8, alpha, None).await;
         sp.finish_and_clear();
         let hits = res?;
         if hits.is_empty() {
@@ -472,8 +385,7 @@ struct Session {
     limit: usize,
     alpha: f32,
     source: Option<String>,
-    hits: Vec<Hit>,
-    used: usize,
+    sources: Vec<SourceRef>,
 }
 
 const CHAT_HELP: &str = "  /source        pick a document to search within (or all)\n  /show N        read source N in full\n  /alpha 0-1     0 = keywords only, 1 = meaning only\n  /limit N       passages retrieved per question\n  /clear         forget this conversation\n  /exit          back to the menu";
@@ -490,10 +402,19 @@ fn chat_header(s: &Session) {
     );
 }
 
-pub async fn chat_session(p: &Pipeline, chat: &ChatClient, opts: ChatOpts) -> Result<()> {
+fn print_source(s: &SourceRef, sk: &MadSkin) {
+    println!("\n{}", style(format!("{} — chunk {}", s.source, s.chunk_index)).green().bold());
+    if !s.headings.is_empty() {
+        println!("{}", style(s.headings.join(" > ")).dim());
+    }
+    println!();
+    sk.print_text(&s.text);
+}
+
+pub async fn chat_session(ctx: &AppContext, opts: ChatOpts) -> Result<()> {
     let th = theme();
     let sk = skin();
-    let mut s = Session { history: vec![], limit: opts.limit, alpha: opts.alpha, source: opts.source, hits: vec![], used: 0 };
+    let mut s = Session { history: vec![], limit: opts.limit, alpha: opts.alpha, source: opts.source, sources: vec![] };
     let mut hist = BasicHistory::new().max_entries(100).no_duplicates(true);
     println!();
     chat_header(&s);
@@ -515,7 +436,7 @@ pub async fn chat_session(p: &Pipeline, chat: &ChatClient, opts: ChatOpts) -> Re
                 "help" => println!("{CHAT_HELP}"),
                 "clear" => {
                     s.history.clear();
-                    s.hits.clear();
+                    s.sources.clear();
                     println!("{}", style("Conversation cleared.").dim());
                 }
                 "alpha" => match arg.parse::<f32>() {
@@ -532,19 +453,12 @@ pub async fn chat_session(p: &Pipeline, chat: &ChatClient, opts: ChatOpts) -> Re
                     }
                     Err(_) => println!("Usage: /limit 4"),
                 },
-                "show" => match arg.parse::<usize>().ok().and_then(|n| n.checked_sub(1)).and_then(|i| s.hits.get(i).filter(|_| i < s.used)) {
-                    Some(h) => {
-                        println!("\n{}", style(format!("{} — chunk {}", h.source, h.chunk_index)).green().bold());
-                        if !h.headings.is_empty() {
-                            println!("{}", style(h.headings.join(" > ")).dim());
-                        }
-                        println!();
-                        sk.print_text(&h.text);
-                    }
+                "show" => match arg.parse::<usize>().ok().and_then(|n| n.checked_sub(1)).and_then(|i| s.sources.get(i)) {
+                    Some(src) => print_source(src, &sk),
                     None => println!("Usage: /show N (a source number from the last answer)"),
                 },
                 "source" => {
-                    let docs = p.store.list_sources().await?;
+                    let docs = ctx.store.list_sources().await?;
                     if docs.is_empty() {
                         println!("{}", style("No documents ingested yet.").yellow());
                     } else {
@@ -567,44 +481,42 @@ pub async fn chat_session(p: &Pipeline, chat: &ChatClient, opts: ChatOpts) -> Re
             }
             continue;
         }
-        if let Err(e) = ask(p, chat, &mut s, &line, &sk).await {
+        if let Err(e) = ask(ctx, &mut s, &line, &sk).await {
             println!("\n{} {e:#}\n", style("Error:").red().bold());
         }
     }
     Ok(())
 }
 
-async fn ask(p: &Pipeline, chat: &ChatClient, s: &mut Session, q: &str, sk: &MadSkin) -> Result<()> {
+async fn ask(ctx: &AppContext, s: &mut Session, q: &str, sk: &MadSkin) -> Result<()> {
     let started = Instant::now();
     let sp = spinner("Searching your documents…");
-    let hits = match api::run_search(p, q, s.limit, s.alpha, s.source.as_deref()).await {
-        Ok(h) => h,
-        Err(e) => {
-            sp.finish_and_clear();
-            return Err(e);
-        }
-    };
-    if hits.is_empty() {
-        sp.finish_and_clear();
-        println!("\n{}\n", style("I couldn't find anything relevant in the indexed documents.").yellow());
+    let sp2 = sp.clone();
+    let res = ctx
+        .rag
+        .answer(q, &s.history, s.limit, s.alpha, s.source.as_deref(), move |stage| match stage {
+            RagStage::Searching => sp2.set_message("Searching your documents…"),
+            RagStage::Generating { passages } => sp2.set_message(format!("Reading {passages} passages and writing an answer…")),
+        })
+        .await;
+    sp.finish_and_clear();
+    let ans = res?;
+    if ans.sources.is_empty() {
+        println!("\n{}\n", style(&ans.answer).yellow());
         return Ok(());
     }
-    sp.set_message(format!("Reading {} passages and writing an answer…", hits.len()));
-    let res = chat.answer(q, &s.history, &hits).await;
-    sp.finish_and_clear();
-    let (answer, used) = res?;
 
     println!("\n{}", style("assistant").cyan().bold());
-    sk.print_text(&highlight_citations(&answer));
+    sk.print_text(&highlight_citations(&ans.answer));
     println!("{}", style("Sources").bold());
-    for (i, h) in hits.iter().take(used).enumerate() {
-        let section = if h.headings.is_empty() { String::new() } else { format!(" › {}", trunc(&h.headings.join(" › "), 50)) };
+    for src in &ans.sources {
+        let section = if src.headings.is_empty() { String::new() } else { format!(" › {}", trunc(&src.headings.join(" › "), 50)) };
         println!(
             "  {} {}{}  {}",
-            style(format!("[{}]", i + 1)).yellow().bold(),
-            style(short(&h.source)).green(),
+            style(format!("[{}]", src.n)).yellow().bold(),
+            style(short(&src.source)).green(),
             style(section).dim(),
-            style(score_bar(h.score)).dim()
+            style(score_bar(src.score)).dim()
         );
     }
     println!(
@@ -613,15 +525,15 @@ async fn ask(p: &Pipeline, chat: &ChatClient, s: &mut Session, q: &str, sk: &Mad
     );
 
     s.history.push(ChatTurn { role: "user".into(), content: q.to_string() });
-    s.history.push(ChatTurn { role: "assistant".into(), content: answer });
-    s.hits = hits;
-    s.used = used;
+    s.history.push(ChatTurn { role: "assistant".into(), content: ans.answer });
+    s.sources = ans.sources;
     Ok(())
 }
 
 // ───────────────────────────── browse / manage ─────────────────────────────
 
-async fn browse_flow(p: &Pipeline, chat: &ChatClient) -> Result<()> {
+async fn browse_flow(ctx: &AppContext) -> Result<()> {
+    let p = &ctx.pipeline;
     let th = theme();
     loop {
         let sp = spinner("Loading documents from Weaviate…");
@@ -657,7 +569,7 @@ async fn browse_flow(p: &Pipeline, chat: &ChatClient) -> Result<()> {
             .interact_opt()?;
         match action {
             Some(0) => {
-                return chat_session(p, chat, ChatOpts { limit: p.cfg.chat_top_k, alpha: 0.5, source: Some(source) }).await;
+                return chat_session(ctx, ChatOpts { limit: p.cfg.chat_top_k, alpha: 0.5, source: Some(source) }).await;
             }
             Some(1) => {
                 let sure = Confirm::with_theme(&th)
@@ -679,79 +591,18 @@ async fn browse_flow(p: &Pipeline, chat: &ChatClient) -> Result<()> {
 
 // ───────────────────────────── status ─────────────────────────────
 
-enum Level {
-    Ok,
-    Warn,
-    Fail,
-}
-
-fn report(level: Level, name: &str, detail: &str) {
-    let mark = match level {
-        Level::Ok => style("✔").green().bold(),
-        Level::Warn => style("!").yellow().bold(),
-        Level::Fail => style("✖").red().bold(),
-    };
-    println!("  {mark} {:<18} {}", style(name).bold(), style(detail).dim());
-}
-
-async fn with_timeout<T>(f: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-    match tokio::time::timeout(Duration::from_secs(6), f).await {
-        Ok(r) => r,
-        Err(_) => Err(anyhow::anyhow!("timed out after 6s")),
-    }
-}
-
-pub async fn status(p: &Pipeline, chat: &ChatClient) -> Result<()> {
+pub async fn status(ctx: &AppContext) -> Result<()> {
     println!("{}\n", style("System status").bold().cyan());
-    let cfg = &p.cfg;
-
-    let sp = spinner("Checking Weaviate…");
-    let weaviate = with_timeout(p.store.is_ready()).await;
-    let docs = if weaviate.is_ok() { with_timeout(p.store.list_sources()).await.ok() } else { None };
+    let sp = spinner("Checking services…");
+    let checks = health::run_checks(ctx).await;
     sp.finish_and_clear();
-    match &weaviate {
-        Ok(()) => report(Level::Ok, "Weaviate", &cfg.weaviate_url),
-        Err(e) => report(Level::Fail, "Weaviate", &format!("{} — {e:#}", cfg.weaviate_url)),
-    }
-    if let Some(d) = docs {
-        let chunks: usize = d.iter().map(|x| x.1).sum();
-        report(Level::Ok, "Index", &format!("{} documents, {chunks} chunks", d.len()));
-    }
-
-    let sp = spinner("Checking the embedding server…");
-    let emb = with_timeout(p.embedder.probe()).await;
-    sp.finish_and_clear();
-    match emb {
-        Ok(dim) => report(Level::Ok, "Embeddings", &format!("{} · {dim} dimensions · {}", cfg.embed_model, cfg.embed_base_url)),
-        Err(e) => report(Level::Fail, "Embeddings", &format!("{} — {e:#}", cfg.embed_base_url)),
-    }
-
-    let sp = spinner("Checking the chat server…");
-    let ch = with_timeout(chat.probe()).await;
-    sp.finish_and_clear();
-    match ch {
-        Ok(m) => report(Level::Ok, "Chat model", &format!("{m} · {}", cfg.chat_base_url)),
-        Err(e) => report(Level::Fail, "Chat model", &format!("{} — {e:#}", cfg.chat_base_url)),
-    }
-
-    match std::fs::metadata(&cfg.chunk_tokenizer) {
-        Ok(m) if m.len() > 1_000_000 => report(
-            Level::Ok,
-            "Tokenizer",
-            &format!("{} ({:.1} MB)", cfg.chunk_tokenizer.display(), m.len() as f64 / 1e6),
-        ),
-        Ok(m) => report(
-            Level::Warn,
-            "Tokenizer",
-            &format!("{} is only {} bytes: wrong file?", cfg.chunk_tokenizer.display(), m.len()),
-        ),
-        Err(_) => report(Level::Fail, "Tokenizer", &format!("not found: {}", cfg.chunk_tokenizer.display())),
-    }
-
-    match std::env::var("ORT_DYLIB_PATH") {
-        Ok(path) if Path::new(&path).exists() => report(Level::Ok, "ONNX Runtime", &path),
-        Ok(path) => report(Level::Fail, "ONNX Runtime", &format!("ORT_DYLIB_PATH points to a missing file: {path}")),
-        Err(_) => report(Level::Warn, "ONNX Runtime", "ORT_DYLIB_PATH not set (needed for PDFs and images)"),
+    for c in &checks {
+        let mark = match c.level {
+            Level::Ok => style("✔").green().bold(),
+            Level::Warn => style("!").yellow().bold(),
+            Level::Fail => style("✖").red().bold(),
+        };
+        println!("  {mark} {:<18} {}", style(c.name).bold(), style(&c.detail).dim());
     }
     Ok(())
 }

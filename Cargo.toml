@@ -24,7 +24,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v5"] }
 walkdir = "2"
-docling = { version = "2.10.0", features = ["chunking", "ort-load-dynamic"], optional = true }
+docling = { version = "2.13.0", features = ["chunking", "ort-load-dynamic"], optional = true }
 utoipa = "6"
 utoipa-swagger-ui = { version = "10", features = ["axum", "vendored"] }
 indicatif = "0.18"
@@ -32,3 +32,9 @@ dialoguer = { version = "0.12", features = ["history", "completion", "fuzzy-sele
 console = "0.16"
 comfy-table = "8"
 termimad = "0.35"
+thiserror = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+futures-util = "0.3"
+unicode-width = "0.2"
