@@ -1,0 +1,40 @@
+# === Rust Build Artifacts ===
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# === Environment & Secrets ===
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# === AI/ML Models & Tokenizers ===
+# Prevents pushing heavy model weights or local tokenizers
+/models/
+*.onnx
+*.bin
+*.gguf
+*.safetensors
+
+# === Local Dependencies & System Binaries ===
+# Blocks local ONNX Runtime dynamic libraries
+*.dylib
+*.so
+*.dll
+
+# === Docker & Local Database Data ===
+# Prevents committing Weaviate persistence data if mapped locally
+.weaviate_data/
+docker-compose.override.yml
+
+# === Operating System Files ===
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp

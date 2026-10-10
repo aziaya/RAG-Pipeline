@@ -1,0 +1,757 @@
+//! Interactive terminal interface: menus, prompts, spinners, progress bars, tables and a
+//! colored chat view. Everything here is presentation; the work is done by `Pipeline`,
+//! `ChatClient` and `Store`.
+
+use crate::{
+    api,
+    chat::{ChatClient, ChatTurn},
+    pipeline::{IngestOutcome, Pipeline, Stage},
+    store::Hit,
+};
+use anyhow::Result;
+use comfy_table::{presets::UTF8_FULL, Cell, Color, ContentArrangement, Table};
+use console::{style, Term};
+use dialoguer::{theme::ColorfulTheme, BasicHistory, Completion, Confirm, FuzzySelect, Input, MultiSelect, Select};
+use indicatif::{HumanDuration, MultiProgress, ProgressBar, ProgressStyle};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+use termimad::MadSkin;
+use walkdir::WalkDir;
+
+pub struct ChatOpts {
+    pub limit: usize,
+    pub alpha: f32,
+    pub source: Option<String>,
+}
+
+// ───────────────────────────── small helpers ─────────────────────────────
+
+fn theme() -> ColorfulTheme {
+    ColorfulTheme::default()
+}
+
+fn spinner(msg: &str) -> ProgressBar {
+    let sp = ProgressBar::new_spinner();
+    sp.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg} {elapsed:.dim}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✔"]),
+    );
+    sp.set_message(msg.to_string());
+    sp.enable_steady_tick(Duration::from_millis(90));
+    sp
+}
+
+fn short(source: &str) -> String {
+    Path::new(source)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(String::from)
+        .unwrap_or_else(|| source.to_string())
+}
+
+/// Collapse whitespace and cut to `n` characters.
+fn trunc(s: &str, n: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= n {
+        flat
+    } else {
+        format!("{}…", flat.chars().take(n.saturating_sub(1)).collect::<String>())
+    }
+}
+
+fn score_bar(score: Option<f64>) -> String {
+    match score {
+        Some(sc) => {
+            let n = (sc.clamp(0.0, 1.0) * 8.0).round() as usize;
+            format!("{}{} {:.2}", "█".repeat(n), "░".repeat(8 - n), sc)
+        }
+        None => String::new(),
+    }
+}
+
+/// Wrap citation markers like [1] in bold so the markdown renderer highlights them.
+fn highlight_citations(s: &str) -> String {
+    let b: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == '[' {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 1 && j < b.len() && b[j] == ']' {
+                out.push_str("**");
+                out.extend(&b[i..=j]);
+                out.push_str("**");
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+fn skin() -> MadSkin {
+    let mut skin = MadSkin::default();
+    skin.bold.set_fg(termimad::crossterm::style::Color::Yellow);
+    skin
+}
+
+/// Turn what a user typed or dragged into the terminal into a real path.
+fn clean_path(input: &str) -> PathBuf {
+    let mut s = input.trim().to_string();
+    if (s.starts_with('\'') && s.ends_with('\'') || s.starts_with('"') && s.ends_with('"')) && s.len() >= 2 {
+        s = s[1..s.len() - 1].to_string();
+    }
+    s = s.replace("\\ ", " ");
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(s)
+}
+
+/// Files under `path` (or `path` itself), skipping hidden files and folders.
+pub fn collect_files(path: &Path) -> Vec<PathBuf> {
+    if path.is_file() {
+        return vec![path.to_path_buf()];
+    }
+    let mut files: Vec<PathBuf> = WalkDir::new(path)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .collect();
+    files.sort();
+    files
+}
+
+/// Tab-completion for filesystem paths in the ingest prompt.
+struct PathCompletion;
+
+impl Completion for PathCompletion {
+    fn get(&self, input: &str) -> Option<String> {
+        let typed = clean_path(input);
+        let (dir, prefix) = if input.ends_with('/') {
+            (typed.clone(), String::new())
+        } else {
+            (
+                typed.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(".")),
+                typed.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            )
+        };
+        let dir = if dir.as_os_str().is_empty() { PathBuf::from(".") } else { dir };
+        let mut names: Vec<(String, bool)> = std::fs::read_dir(&dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| Some((e.file_name().to_str()?.to_string(), e.path().is_dir())))
+            .filter(|(n, _)| n.starts_with(&prefix) && (prefix.starts_with('.') || !n.starts_with('.')))
+            .collect();
+        names.sort();
+        let first = names.first()?.clone();
+        // Longest common prefix of all matches
+        let mut common = first.0.clone();
+        for (n, _) in &names {
+            while !n.starts_with(&common) {
+                common.pop();
+            }
+        }
+        let completed = if names.len() == 1 && first.1 { format!("{common}/") } else { common };
+        let base = input.rsplit_once('/').map(|(b, _)| format!("{b}/")).unwrap_or_default();
+        Some(format!("{base}{completed}"))
+    }
+}
+
+fn banner(p: &Pipeline) {
+    let _ = Term::stdout().clear_screen();
+    println!("{}", style("  RAG PIPELINE  ").bold().white().on_blue());
+    println!(
+        "{}\n",
+        style(format!("docling → {} → Weaviate @ {}", p.cfg.embed_model, p.cfg.weaviate_url)).dim()
+    );
+}
+
+fn pause() {
+    println!("\n{}", style("Press any key to return to the menu…").dim());
+    let _ = Term::stdout().read_key();
+}
+
+fn new_table(header: &[&str]) -> Table {
+    let mut t = Table::new();
+    t.load_style(UTF8_FULL.with_rounded_corners())
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(header.iter().map(|h| Cell::new(h).fg(Color::Cyan)).collect::<Vec<_>>());
+    t
+}
+
+fn hits_table(hits: &[Hit]) -> Table {
+    let mut t = new_table(&["#", "Score", "Document", "Section", "Preview"]);
+    for (i, h) in hits.iter().enumerate() {
+        t.add_row(vec![
+            Cell::new(i + 1).fg(Color::Yellow),
+            Cell::new(score_bar(h.score)).fg(Color::Green),
+            Cell::new(short(&h.source)),
+            Cell::new(trunc(&h.headings.join(" > "), 40)),
+            Cell::new(trunc(&h.text, 110)),
+        ]);
+    }
+    t
+}
+
+// ───────────────────────────── main menu ─────────────────────────────
+
+pub async fn run_menu(p: &Pipeline, chat: &ChatClient) -> Result<()> {
+    let items = [
+        "Chat with your documents",
+        "Search your documents",
+        "Ingest files or a folder",
+        "Browse and manage documents",
+        "System status",
+        "Quit",
+    ];
+    loop {
+        banner(p);
+        let choice = Select::with_theme(&theme())
+            .with_prompt("What would you like to do?  (↑/↓ move, Enter select, Esc quit)")
+            .items(&items)
+            .default(0)
+            .interact_opt()?;
+        let result = match choice {
+            Some(0) => {
+                chat_session(
+                    p,
+                    chat,
+                    ChatOpts { limit: p.cfg.chat_top_k, alpha: 0.5, source: None },
+                )
+                .await
+            }
+            Some(1) => search_flow(p).await,
+            Some(2) => ingest_flow(p).await,
+            Some(3) => browse_flow(p, chat).await,
+            Some(4) => status(p, chat).await,
+            _ => break,
+        };
+        match result {
+            Err(e) => {
+                println!("\n{} {e:#}", style("Error:").red().bold());
+                pause();
+            }
+            Ok(()) if choice != Some(0) => pause(),
+            Ok(()) => {}
+        }
+    }
+    let _ = Term::stdout().show_cursor();
+    println!("Goodbye.");
+    Ok(())
+}
+
+// ───────────────────────────── ingest ─────────────────────────────
+
+async fn ingest_flow(p: &Pipeline) -> Result<()> {
+    let th = theme();
+    let raw: String = Input::with_theme(&th)
+        .with_prompt("Path to a file or folder (Tab completes, drag & drop works)")
+        .completion_with(&PathCompletion)
+        .validate_with(|s: &String| -> std::result::Result<(), String> {
+            if clean_path(s).exists() {
+                Ok(())
+            } else {
+                Err("that path does not exist".into())
+            }
+        })
+        .interact_text()?;
+    let path = clean_path(&raw);
+    let mut files = collect_files(&path);
+    if files.is_empty() {
+        println!("{}", style("No files found there.").yellow());
+        return Ok(());
+    }
+
+    if files.len() > 1 {
+        let mut exts: std::collections::BTreeMap<String, usize> = Default::default();
+        for f in &files {
+            let e = f.extension().and_then(|e| e.to_str()).unwrap_or("(none)").to_lowercase();
+            *exts.entry(e).or_default() += 1;
+        }
+        let summary = exts.iter().map(|(e, n)| format!("{n} .{e}")).collect::<Vec<_>>().join(", ");
+        println!("Found {} files: {}", style(files.len()).bold(), style(summary).dim());
+        let pick = Select::with_theme(&th)
+            .with_prompt("How do you want to proceed?")
+            .items(&[format!("Ingest all {} files", files.len()), "Choose which files…".to_string(), "Cancel".to_string()])
+            .default(0)
+            .interact_opt()?;
+        match pick {
+            Some(0) => {}
+            Some(1) => {
+                let names: Vec<String> = files
+                    .iter()
+                    .map(|f| f.strip_prefix(&path).unwrap_or(f).display().to_string())
+                    .collect();
+                let chosen = MultiSelect::with_theme(&th)
+                    .with_prompt("Space toggles, a toggles all, Enter confirms")
+                    .items(&names)
+                    .defaults(&vec![true; names.len()])
+                    .max_length(15)
+                    .interact_opt()?
+                    .unwrap_or_default();
+                files = chosen.into_iter().map(|i| files[i].clone()).collect();
+                if files.is_empty() {
+                    println!("Nothing selected.");
+                    return Ok(());
+                }
+            }
+            _ => return Ok(()),
+        }
+    }
+    ingest_paths(p, files).await
+}
+
+fn stage_text(name: &str, s: &Stage) -> String {
+    match s {
+        Stage::Checking => format!("{name}  checking for changes"),
+        Stage::Extracting => format!("{name}  extracting and chunking (docling)"),
+        Stage::Embedding { done, total } => {
+            let width = 20;
+            let filled = if *total == 0 { 0 } else { done * width / total };
+            format!(
+                "{name}  embedding [{}{}] {done}/{total} chunks",
+                "█".repeat(filled),
+                "░".repeat(width - filled)
+            )
+        }
+        Stage::Indexing => format!("{name}  writing to Weaviate"),
+    }
+}
+
+/// Ingest files one after another with an overall progress bar and a live stage line,
+/// then print a summary table. Used by the menu and by `rag-pipeline ingest`.
+pub async fn ingest_paths(p: &Pipeline, files: Vec<PathBuf>) -> Result<()> {
+    p.store.ensure_schema().await?;
+    let mp = MultiProgress::new();
+    let overall = mp.add(ProgressBar::new(files.len() as u64));
+    overall.set_style(
+        ProgressStyle::with_template("{prefix:.bold} [{bar:30.cyan/blue}] {pos}/{len} files  {elapsed_precise}  ETA {eta}")
+            .unwrap()
+            .progress_chars("█▓░"),
+    );
+    overall.set_prefix("Ingesting");
+    let stage = mp.add(ProgressBar::new_spinner());
+    stage.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+    stage.enable_steady_tick(Duration::from_millis(90));
+
+    let mut rows: Vec<(String, std::result::Result<IngestOutcome, String>, Duration)> = Vec::new();
+    for f in &files {
+        let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let source = std::fs::canonicalize(f).unwrap_or_else(|_| f.clone()).to_string_lossy().to_string();
+        stage.set_message(stage_text(&name, &Stage::Checking));
+        let started = Instant::now();
+        let res = p
+            .ingest_file_progress(f, &source, |s| stage.set_message(stage_text(&name, &s)))
+            .await
+            .map_err(|e| format!("{e:#}"));
+        rows.push((name, res, started.elapsed()));
+        overall.inc(1);
+    }
+    stage.finish_and_clear();
+    overall.finish_and_clear();
+
+    let mut t = new_table(&["File", "Status", "Chunks", "Time"]);
+    let (mut ok, mut skipped, mut failed) = (0, 0, 0);
+    for (name, res, took) in &rows {
+        let (status, color, chunks) = match res {
+            Ok(IngestOutcome::Indexed { chunks, .. }) => {
+                ok += 1;
+                ("indexed", Color::Green, chunks.to_string())
+            }
+            Ok(IngestOutcome::Skipped { .. }) => {
+                skipped += 1;
+                ("unchanged, skipped", Color::Yellow, "-".into())
+            }
+            Err(_) => {
+                failed += 1;
+                ("failed", Color::Red, "-".into())
+            }
+        };
+        t.add_row(vec![
+            Cell::new(name),
+            Cell::new(status).fg(color),
+            Cell::new(chunks),
+            Cell::new(format!("{:.1}s", took.as_secs_f32())),
+        ]);
+    }
+    println!("{t}");
+    println!(
+        "{} indexed, {} skipped, {} failed",
+        style(ok).green().bold(),
+        style(skipped).yellow().bold(),
+        style(failed).red().bold()
+    );
+    for (name, res, _) in &rows {
+        if let Err(e) = res {
+            println!("  {} {}: {}", style("✖").red(), style(name).bold(), trunc(e, 300));
+        }
+    }
+    Ok(())
+}
+
+// ───────────────────────────── search ─────────────────────────────
+
+async fn search_flow(p: &Pipeline) -> Result<()> {
+    let th = theme();
+    let mode = Select::with_theme(&th)
+        .with_prompt("Search mode")
+        .items(&[
+            "Hybrid: keywords + meaning (recommended)",
+            "Keyword-leaning (names, codes, exact terms)",
+            "Meaning-leaning (paraphrased questions)",
+        ])
+        .default(0)
+        .interact_opt()?;
+    let alpha = match mode {
+        Some(0) => 0.5,
+        Some(1) => 0.15,
+        Some(2) => 0.85,
+        _ => return Ok(()),
+    };
+    let mut hist = BasicHistory::new().max_entries(50).no_duplicates(true);
+    loop {
+        let q: String = Input::with_theme(&th)
+            .with_prompt("Search query (empty to go back)")
+            .allow_empty(true)
+            .history_with(&mut hist)
+            .interact_text()?;
+        if q.trim().is_empty() {
+            return Ok(());
+        }
+        let sp = spinner("Embedding the query and searching Weaviate…");
+        let res = api::run_search(p, q.trim(), 8, alpha, None).await;
+        sp.finish_and_clear();
+        let hits = res?;
+        if hits.is_empty() {
+            println!("{}", style("No results.").yellow());
+            continue;
+        }
+        println!("{}", hits_table(&hits));
+        let sk = skin();
+        loop {
+            let mut items: Vec<String> = hits
+                .iter()
+                .enumerate()
+                .map(|(i, h)| format!("Read result {} — {}", i + 1, trunc(&format!("{} {}", short(&h.source), h.headings.join(" > ")), 60)))
+                .collect();
+            items.push("New search".into());
+            let pick = Select::with_theme(&th).with_prompt("Open a result").items(&items).default(0).interact_opt()?;
+            match pick {
+                Some(i) if i < hits.len() => {
+                    let h = &hits[i];
+                    println!("\n{}", style(format!("{} — chunk {}", h.source, h.chunk_index)).green().bold());
+                    if !h.headings.is_empty() {
+                        println!("{}", style(h.headings.join(" > ")).dim());
+                    }
+                    println!();
+                    sk.print_text(&h.text);
+                }
+                _ => break,
+            }
+        }
+    }
+}
+
+// ───────────────────────────── chat ─────────────────────────────
+
+struct Session {
+    history: Vec<ChatTurn>,
+    limit: usize,
+    alpha: f32,
+    source: Option<String>,
+    hits: Vec<Hit>,
+    used: usize,
+}
+
+const CHAT_HELP: &str = "  /source        pick a document to search within (or all)\n  /show N        read source N in full\n  /alpha 0-1     0 = keywords only, 1 = meaning only\n  /limit N       passages retrieved per question\n  /clear         forget this conversation\n  /exit          back to the menu";
+
+fn chat_header(s: &Session) {
+    let scope = match &s.source {
+        Some(f) => format!("document: {}", short(f)),
+        None => "all documents".to_string(),
+    };
+    println!(
+        "{}  {}",
+        style("Chat").bold().cyan(),
+        style(format!("scope: {scope} · top {} · alpha {:.2} · /help for commands", s.limit, s.alpha)).dim()
+    );
+}
+
+pub async fn chat_session(p: &Pipeline, chat: &ChatClient, opts: ChatOpts) -> Result<()> {
+    let th = theme();
+    let sk = skin();
+    let mut s = Session { history: vec![], limit: opts.limit, alpha: opts.alpha, source: opts.source, hits: vec![], used: 0 };
+    let mut hist = BasicHistory::new().max_entries(100).no_duplicates(true);
+    println!();
+    chat_header(&s);
+    println!();
+    loop {
+        let line: String = match Input::<String>::with_theme(&th).with_prompt("you").allow_empty(true).history_with(&mut hist).interact_text() {
+            Ok(l) => l.trim().to_string(),
+            Err(_) => break, // Ctrl-C
+        };
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(cmd) = line.strip_prefix('/') {
+            let mut parts = cmd.splitn(2, ' ');
+            let name = parts.next().unwrap_or("");
+            let arg = parts.next().unwrap_or("").trim();
+            match name {
+                "exit" | "quit" | "menu" => break,
+                "help" => println!("{CHAT_HELP}"),
+                "clear" => {
+                    s.history.clear();
+                    s.hits.clear();
+                    println!("{}", style("Conversation cleared.").dim());
+                }
+                "alpha" => match arg.parse::<f32>() {
+                    Ok(a) => {
+                        s.alpha = a.clamp(0.0, 1.0);
+                        chat_header(&s);
+                    }
+                    Err(_) => println!("Usage: /alpha 0.5"),
+                },
+                "limit" => match arg.parse::<usize>() {
+                    Ok(n) => {
+                        s.limit = n.clamp(1, 20);
+                        chat_header(&s);
+                    }
+                    Err(_) => println!("Usage: /limit 4"),
+                },
+                "show" => match arg.parse::<usize>().ok().and_then(|n| n.checked_sub(1)).and_then(|i| s.hits.get(i).filter(|_| i < s.used)) {
+                    Some(h) => {
+                        println!("\n{}", style(format!("{} — chunk {}", h.source, h.chunk_index)).green().bold());
+                        if !h.headings.is_empty() {
+                            println!("{}", style(h.headings.join(" > ")).dim());
+                        }
+                        println!();
+                        sk.print_text(&h.text);
+                    }
+                    None => println!("Usage: /show N (a source number from the last answer)"),
+                },
+                "source" => {
+                    let docs = p.store.list_sources().await?;
+                    if docs.is_empty() {
+                        println!("{}", style("No documents ingested yet.").yellow());
+                    } else {
+                        let mut items = vec!["All documents".to_string()];
+                        items.extend(docs.iter().map(|(n, c)| format!("{}  ({c} chunks)", short(n))));
+                        let sel = FuzzySelect::with_theme(&th)
+                            .with_prompt("Search within (type to filter, Esc to cancel)")
+                            .items(&items)
+                            .default(0)
+                            .interact_opt()?;
+                        match sel {
+                            Some(0) => s.source = None,
+                            Some(i) => s.source = Some(docs[i - 1].0.clone()),
+                            None => {}
+                        }
+                        chat_header(&s);
+                    }
+                }
+                _ => println!("Unknown command.\n{CHAT_HELP}"),
+            }
+            continue;
+        }
+        if let Err(e) = ask(p, chat, &mut s, &line, &sk).await {
+            println!("\n{} {e:#}\n", style("Error:").red().bold());
+        }
+    }
+    Ok(())
+}
+
+async fn ask(p: &Pipeline, chat: &ChatClient, s: &mut Session, q: &str, sk: &MadSkin) -> Result<()> {
+    let started = Instant::now();
+    let sp = spinner("Searching your documents…");
+    let hits = match api::run_search(p, q, s.limit, s.alpha, s.source.as_deref()).await {
+        Ok(h) => h,
+        Err(e) => {
+            sp.finish_and_clear();
+            return Err(e);
+        }
+    };
+    if hits.is_empty() {
+        sp.finish_and_clear();
+        println!("\n{}\n", style("I couldn't find anything relevant in the indexed documents.").yellow());
+        return Ok(());
+    }
+    sp.set_message(format!("Reading {} passages and writing an answer…", hits.len()));
+    let res = chat.answer(q, &s.history, &hits).await;
+    sp.finish_and_clear();
+    let (answer, used) = res?;
+
+    println!("\n{}", style("assistant").cyan().bold());
+    sk.print_text(&highlight_citations(&answer));
+    println!("{}", style("Sources").bold());
+    for (i, h) in hits.iter().take(used).enumerate() {
+        let section = if h.headings.is_empty() { String::new() } else { format!(" › {}", trunc(&h.headings.join(" › "), 50)) };
+        println!(
+            "  {} {}{}  {}",
+            style(format!("[{}]", i + 1)).yellow().bold(),
+            style(short(&h.source)).green(),
+            style(section).dim(),
+            style(score_bar(h.score)).dim()
+        );
+    }
+    println!(
+        "{}\n",
+        style(format!("answered in {} · /show N reads a source · /help", HumanDuration(started.elapsed()))).dim()
+    );
+
+    s.history.push(ChatTurn { role: "user".into(), content: q.to_string() });
+    s.history.push(ChatTurn { role: "assistant".into(), content: answer });
+    s.hits = hits;
+    s.used = used;
+    Ok(())
+}
+
+// ───────────────────────────── browse / manage ─────────────────────────────
+
+async fn browse_flow(p: &Pipeline, chat: &ChatClient) -> Result<()> {
+    let th = theme();
+    loop {
+        let sp = spinner("Loading documents from Weaviate…");
+        let docs = p.store.list_sources().await;
+        sp.finish_and_clear();
+        let docs = docs?;
+        if docs.is_empty() {
+            println!("{}", style("Nothing ingested yet. Use “Ingest files or a folder”.").yellow());
+            return Ok(());
+        }
+        let total: usize = docs.iter().map(|d| d.1).sum();
+        let mut t = new_table(&["#", "Document", "Chunks"]);
+        for (i, (name, n)) in docs.iter().enumerate() {
+            t.add_row(vec![Cell::new(i + 1).fg(Color::Yellow), Cell::new(short(name)), Cell::new(n)]);
+        }
+        println!("{t}");
+        println!("{} documents, {} chunks\n", style(docs.len()).bold(), style(total).bold());
+
+        let mut items: Vec<String> = docs.iter().map(|(n, c)| format!("{}  ({c} chunks)", n)).collect();
+        items.push("Back to menu".into());
+        let pick = FuzzySelect::with_theme(&th)
+            .with_prompt("Select a document (type to filter, Esc to go back)")
+            .items(&items)
+            .default(0)
+            .interact_opt()?;
+        let Some(i) = pick.filter(|i| *i < docs.len()) else { return Ok(()) };
+        let (source, _) = docs[i].clone();
+
+        let action = Select::with_theme(&th)
+            .with_prompt(format!("{}", short(&source)))
+            .items(&["Chat about this document", "Delete this document from the index", "Back"])
+            .default(0)
+            .interact_opt()?;
+        match action {
+            Some(0) => {
+                return chat_session(p, chat, ChatOpts { limit: p.cfg.chat_top_k, alpha: 0.5, source: Some(source) }).await;
+            }
+            Some(1) => {
+                let sure = Confirm::with_theme(&th)
+                    .with_prompt(format!("Delete all chunks of “{}” from Weaviate? (the original file is not touched)", short(&source)))
+                    .default(false)
+                    .interact()?;
+                if sure {
+                    let sp = spinner("Deleting…");
+                    let r = p.store.delete_source(&source).await;
+                    sp.finish_and_clear();
+                    r?;
+                    println!("{} deleted {}", style("✔").green(), short(&source));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ───────────────────────────── status ─────────────────────────────
+
+enum Level {
+    Ok,
+    Warn,
+    Fail,
+}
+
+fn report(level: Level, name: &str, detail: &str) {
+    let mark = match level {
+        Level::Ok => style("✔").green().bold(),
+        Level::Warn => style("!").yellow().bold(),
+        Level::Fail => style("✖").red().bold(),
+    };
+    println!("  {mark} {:<18} {}", style(name).bold(), style(detail).dim());
+}
+
+async fn with_timeout<T>(f: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    match tokio::time::timeout(Duration::from_secs(6), f).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!("timed out after 6s")),
+    }
+}
+
+pub async fn status(p: &Pipeline, chat: &ChatClient) -> Result<()> {
+    println!("{}\n", style("System status").bold().cyan());
+    let cfg = &p.cfg;
+
+    let sp = spinner("Checking Weaviate…");
+    let weaviate = with_timeout(p.store.is_ready()).await;
+    let docs = if weaviate.is_ok() { with_timeout(p.store.list_sources()).await.ok() } else { None };
+    sp.finish_and_clear();
+    match &weaviate {
+        Ok(()) => report(Level::Ok, "Weaviate", &cfg.weaviate_url),
+        Err(e) => report(Level::Fail, "Weaviate", &format!("{} — {e:#}", cfg.weaviate_url)),
+    }
+    if let Some(d) = docs {
+        let chunks: usize = d.iter().map(|x| x.1).sum();
+        report(Level::Ok, "Index", &format!("{} documents, {chunks} chunks", d.len()));
+    }
+
+    let sp = spinner("Checking the embedding server…");
+    let emb = with_timeout(p.embedder.probe()).await;
+    sp.finish_and_clear();
+    match emb {
+        Ok(dim) => report(Level::Ok, "Embeddings", &format!("{} · {dim} dimensions · {}", cfg.embed_model, cfg.embed_base_url)),
+        Err(e) => report(Level::Fail, "Embeddings", &format!("{} — {e:#}", cfg.embed_base_url)),
+    }
+
+    let sp = spinner("Checking the chat server…");
+    let ch = with_timeout(chat.probe()).await;
+    sp.finish_and_clear();
+    match ch {
+        Ok(m) => report(Level::Ok, "Chat model", &format!("{m} · {}", cfg.chat_base_url)),
+        Err(e) => report(Level::Fail, "Chat model", &format!("{} — {e:#}", cfg.chat_base_url)),
+    }
+
+    match std::fs::metadata(&cfg.chunk_tokenizer) {
+        Ok(m) if m.len() > 1_000_000 => report(
+            Level::Ok,
+            "Tokenizer",
+            &format!("{} ({:.1} MB)", cfg.chunk_tokenizer.display(), m.len() as f64 / 1e6),
+        ),
+        Ok(m) => report(
+            Level::Warn,
+            "Tokenizer",
+            &format!("{} is only {} bytes: wrong file?", cfg.chunk_tokenizer.display(), m.len()),
+        ),
+        Err(_) => report(Level::Fail, "Tokenizer", &format!("not found: {}", cfg.chunk_tokenizer.display())),
+    }
+
+    match std::env::var("ORT_DYLIB_PATH") {
+        Ok(path) if Path::new(&path).exists() => report(Level::Ok, "ONNX Runtime", &path),
+        Ok(path) => report(Level::Fail, "ONNX Runtime", &format!("ORT_DYLIB_PATH points to a missing file: {path}")),
+        Err(_) => report(Level::Warn, "ONNX Runtime", "ORT_DYLIB_PATH not set (needed for PDFs and images)"),
+    }
+    Ok(())
+}
