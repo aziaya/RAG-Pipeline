@@ -1,6 +1,9 @@
-# Performant RAG Pipeline
+# RAG Spark
 
-Rust ingestion, hybrid retrieval and chat over your documents:  
+
+Blazing fast High-performance RAG in pure Rust. Ingest documents, hybrid retrieve, and chat with local models
+
+Ingestion, hybrid retrieval and chat over your documents:  
 **docling.rs** (extract + token-aware chunking) → **EmbeddingGemma 2** (OpenAI-compatible endpoint) → **Weaviate** (bring-your-own vectors) → answers from a local chat model (llama-server).
 
 ```
