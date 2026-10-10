@@ -1,4 +1,4 @@
-# rag-pipeline
+# Performant RAG Pipeline
 
 Rust ingestion, hybrid retrieval and chat over your documents:  
 **docling.rs** (extract + token-aware chunking) → **EmbeddingGemma 2** (OpenAI-compatible endpoint) → **Weaviate** (bring-your-own vectors) → answers from a local chat model (llama-server).
