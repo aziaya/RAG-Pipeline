@@ -113,5 +113,4 @@ Keys: `Esc` leaves the text field (NAV mode), `i`/`Enter` types again, `1`-`5` /
 - Weaviate is queried over REST + GraphQL (there is no official Rust client).
 - Documents ingested from the terminal are identified by their full path; uploads through `/ingest` by filename.
 - Ingestion embeds before it deletes a document's old chunks, but delete + insert is not atomic.
-- Without the `docling` feature only `.txt`, `.md` and `.csv` can be read.
 ```
