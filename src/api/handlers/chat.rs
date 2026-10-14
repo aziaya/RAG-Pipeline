@@ -4,7 +4,7 @@ use crate::{
         error::{internal, ApiError},
         state::AppState,
     },
-    models::chat::ChatAnswer,
+    models::chat::{ChatAnswer, ChatMemory},
     services::rag::RagError,
 };
 use axum::{extract::State, http::StatusCode, Json};
@@ -25,12 +25,14 @@ pub async fn chat(State(st): State<AppState>, Json(req): Json<ChatReq>) -> Resul
     if question.is_empty() || question.chars().count() > 4000 {
         return Err(ApiError::bad_request("question must be 1-4000 characters"));
     }
-    let limit = req.limit.unwrap_or(st.ctx.cfg.chat_top_k).clamp(1, 20);
+    let opts = req.params.apply(st.ctx.cfg.retrieval_defaults());
+    let memory = ChatMemory { summary: req.summary.clone().filter(|s| !s.trim().is_empty()), turns: req.history.clone() };
+    let rewrite = req.rewrite.unwrap_or(st.ctx.cfg.chat_rewrite);
     let _permit = st.chat_permits.acquire().await.map_err(internal)?;
     let answer = st
         .ctx
         .rag
-        .answer(question, &req.history, limit, req.alpha.clamp(0.0, 1.0), req.source.as_deref(), |_| {})
+        .answer(question, &memory, &opts, rewrite, |_| {})
         .await
         .map_err(|e| match e {
             RagError::Retrieval(_) => internal(e),

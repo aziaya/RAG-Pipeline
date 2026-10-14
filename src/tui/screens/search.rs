@@ -1,12 +1,12 @@
 use super::{RenderCtx, Screen};
 use crate::{
     context::AppContext,
-    models::search::Hit,
+    models::search::{Hit, SearchMode},
     tui::{
         app::{AppMsg, Mode},
         input::{InputEvent, InputLine},
         markdown, theme,
-        widgets::centered,
+        widgets::{centered, Picker, PickerEvent},
     },
     util::{score_bar, short, trunc},
 };
@@ -21,13 +21,11 @@ use ratatui::{
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 
-const MODES: [(&str, f32); 3] = [("hybrid", 0.5), ("keyword-leaning", 0.15), ("meaning-leaning", 0.85)];
-
 pub struct SearchScreen {
     ctx: AppContext,
     tx: UnboundedSender<AppMsg>,
     input: InputLine,
-    mode_idx: usize,
+    mode: SearchMode,
     hits: Vec<Hit>,
     table: TableState,
     last_query: String,
@@ -35,6 +33,10 @@ pub struct SearchScreen {
     status: String,
     detail: Option<usize>,
     detail_scroll: usize,
+    /// Collections to search; empty = all.
+    collections: Vec<String>,
+    /// Collection picker; `None` entry = all collections.
+    picker: Option<(Picker, Vec<Option<String>>)>,
 }
 
 impl SearchScreen {
@@ -43,7 +45,7 @@ impl SearchScreen {
             ctx,
             tx,
             input: InputLine::default(),
-            mode_idx: 0,
+            mode: SearchMode::Hybrid,
             hits: vec![],
             table: TableState::default(),
             last_query: String::new(),
@@ -51,6 +53,8 @@ impl SearchScreen {
             status: "Type a query and press Enter. Tab changes the search mode.".into(),
             detail: None,
             detail_scroll: 0,
+            collections: vec![],
+            picker: None,
         }
     }
 
@@ -61,9 +65,13 @@ impl SearchScreen {
         }
         self.last_query = q.clone();
         self.busy = Some(Instant::now());
-        let (ctx, tx, alpha) = (self.ctx.clone(), self.tx.clone(), MODES[self.mode_idx].1);
+        let (ctx, tx) = (self.ctx.clone(), self.tx.clone());
+        let mut opts = ctx.cfg.retrieval_defaults();
+        opts.mode = self.mode;
+        opts.top_k = 10;
+        opts.collections = self.collections.clone();
         tokio::spawn(async move {
-            let r = ctx.rag.search(&q, 10, alpha, None).await.map_err(|e| format!("{e:#}"));
+            let r = ctx.rag.search(&q, &opts.sanitized()).await.map_err(|e| format!("{e:#}"));
             let _ = tx.send(AppMsg::Search(r));
         });
     }
@@ -72,7 +80,7 @@ impl SearchScreen {
         let took = self.busy.take().map(|s| s.elapsed().as_millis()).unwrap_or(0);
         match r {
             Ok(hits) => {
-                self.status = format!("{} result(s) in {took} ms · mode: {}", hits.len(), MODES[self.mode_idx].0);
+                self.status = format!("{} result(s) in {took} ms · mode: {}", hits.len(), self.mode.label());
                 self.table.select(if hits.is_empty() { None } else { Some(0) });
                 self.hits = hits;
             }
@@ -80,6 +88,30 @@ impl SearchScreen {
                 self.hits.clear();
                 self.status = format!("Search failed: {e}");
             }
+        }
+    }
+
+    fn request_collections(&self) {
+        let (ctx, tx) = (self.ctx.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let r = ctx.store.list_collections().await.map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppMsg::SearchCollections(r));
+        });
+    }
+
+    pub fn on_collections(&mut self, r: Result<Vec<(String, usize)>, String>) {
+        match r {
+            Ok(cols) if !cols.is_empty() => {
+                let mut items = vec!["All collections (default)".to_string()];
+                let mut values = vec![None];
+                for (name, chunks) in cols {
+                    items.push(format!("{name}  ({chunks} chunks)"));
+                    values.push(Some(name));
+                }
+                self.picker = Some((Picker::new("Search within a collection", items), values));
+            }
+            Ok(_) => self.status = "No collections yet. Ingest a document first.".into(),
+            Err(e) => self.status = format!("Could not list collections: {e}"),
         }
     }
 
@@ -105,10 +137,29 @@ impl Screen for SearchScreen {
     }
 
     fn popup_open(&self) -> bool {
-        self.detail.is_some()
+        self.detail.is_some() || self.picker.is_some()
     }
 
     fn on_key(&mut self, key: KeyEvent, mode: Mode) -> bool {
+        if self.picker.is_some() {
+            let ev = self.picker.as_mut().map(|(p, _)| p.on_key(key)).unwrap_or(PickerEvent::None);
+            match ev {
+                PickerEvent::Chosen(i) => {
+                    if let Some((_, values)) = self.picker.take() {
+                        self.collections = values.get(i).cloned().flatten().into_iter().collect();
+                        self.status = if self.collections.is_empty() { "Searching all collections.".into() } else { format!("Searching collection “{}”.", self.collections[0]) };
+                        self.last_query.clear(); // the next Enter searches again with the new scope
+                    }
+                }
+                PickerEvent::Cancel => self.picker = None,
+                PickerEvent::None => {}
+            }
+            return true;
+        }
+        if (mode == Mode::Input && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) && key.code == KeyCode::Char('k')) || (mode == Mode::Nav && key.code == KeyCode::Char('f')) {
+            self.request_collections();
+            return true;
+        }
         if self.detail.is_some() {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.detail = None,
@@ -136,8 +187,8 @@ impl Screen for SearchScreen {
                 }
                 _ => {
                     if let InputEvent::Tab = self.input.on_key(key) {
-                        self.mode_idx = (self.mode_idx + 1) % MODES.len();
-                        self.status = format!("Search mode: {}", MODES[self.mode_idx].0);
+                        self.mode = self.mode.next();
+                        self.status = format!("Search mode: {}", self.mode.label());
                     }
                 }
             }
@@ -158,7 +209,7 @@ impl Screen for SearchScreen {
         let typing = rc.focused && rc.mode == Mode::Input;
         let title = Line::from(vec![
             Span::styled(" Search ", theme::bold(Color::White)),
-            Span::styled(format!("· {} ", MODES[self.mode_idx].0), theme::dim()),
+            Span::styled(format!("· {} · {} ", self.mode.label(), if self.collections.is_empty() { "all collections".to_string() } else { self.collections.join(", ") }), theme::dim()),
         ]);
         let ib = theme::pane(title, typing);
         let iin = ib.inner(input_area);
@@ -200,6 +251,9 @@ impl Screen for SearchScreen {
     }
 
     fn render_popup(&mut self, f: &mut Frame) {
+        if let Some((p, _)) = self.picker.as_mut() {
+            p.render(f);
+        }
         if let Some(i) = self.detail {
             if let Some(h) = self.hits.get(i) {
                 let full = f.area();
@@ -224,8 +278,8 @@ impl Screen for SearchScreen {
 
     fn hints(&self, mode: Mode) -> &'static str {
         match mode {
-            Mode::Input => "Enter search / open result · ↑↓ select · Tab mode · Esc → navigate",
-            Mode::Nav => "i type · j/k select · Enter open · 1-5 screens · Tab pane · q quit",
+            Mode::Input => "Enter search / open result · ↑↓ select · Tab mode · Ctrl-K collection · Esc → navigate",
+            Mode::Nav => "i type · j/k select · Enter open · f collection · 1-5 screens · Tab pane · q quit",
         }
     }
 }

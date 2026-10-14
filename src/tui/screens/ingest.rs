@@ -1,15 +1,19 @@
 use super::{RenderCtx, Screen};
 use crate::{
     context::AppContext,
-    models::document::{IngestOutcome, Stage},
+    models::{
+        collection::sanitize_collection,
+        document::{IngestOutcome, Stage},
+    },
     tui::{
         app::{AppMsg, Mode},
         input::{InputEvent, InputLine},
         theme,
+        widgets::{Picker, PickerEvent},
     },
     util::{clean_path, collect_files, complete_path, trunc},
 };
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
@@ -28,6 +32,8 @@ use std::{
 use tokio::sync::mpsc::UnboundedSender;
 
 pub enum IngestMsg {
+    /// Existing collections, for the collection picker.
+    Collections(Result<Vec<(String, usize)>, String>),
     Started { idx: usize },
     Stage { idx: usize, stage: Stage },
     Done { idx: usize, result: Result<IngestOutcome, String> },
@@ -60,10 +66,17 @@ pub struct IngestScreen {
     run_started: Option<Instant>,
     notice: Option<String>,
     table: TableState,
+    /// Collection the next run saves into.
+    collection: String,
+    /// The input box is asking for a new collection name instead of a path.
+    naming: bool,
+    /// Collection picker; `None` entry = "new collection…".
+    picker: Option<(Picker, Vec<Option<String>>)>,
 }
 
 impl IngestScreen {
     pub fn new(ctx: AppContext, tx: UnboundedSender<AppMsg>) -> Self {
+        let collection = ctx.cfg.default_collection.clone();
         Self {
             ctx,
             tx,
@@ -72,13 +85,22 @@ impl IngestScreen {
             running: false,
             cancel: Arc::new(AtomicBool::new(false)),
             run_started: None,
-            notice: Some("Type a file or folder path and press Enter. Tab completes paths.".into()),
+            notice: Some("Type a file or folder path and press Enter. Tab completes paths. Ctrl-K chooses the collection.".into()),
             table: TableState::default(),
+            collection,
+            naming: false,
+            picker: None,
         }
     }
 
     fn submit(&mut self, raw: String) {
         if raw.trim().is_empty() {
+            return;
+        }
+        if self.naming {
+            self.naming = false;
+            self.collection = sanitize_collection(&raw, &self.ctx.cfg.default_collection);
+            self.notice = Some(format!("Saving into collection “{}”. Now type a path.", self.collection));
             return;
         }
         if self.running {
@@ -107,13 +129,14 @@ impl IngestScreen {
         self.running = true;
         self.run_started = Some(Instant::now());
         self.cancel.store(false, Ordering::Relaxed);
-        self.notice = Some(format!("Ingesting {} file(s)…", files.len()));
+        self.notice = Some(format!("Ingesting {} file(s) into “{}”…", files.len(), self.collection));
         self.table.select(Some(0));
         self.spawn(files);
     }
 
     fn spawn(&self, files: Vec<PathBuf>) {
         let (ctx, tx, cancel) = (self.ctx.clone(), self.tx.clone(), self.cancel.clone());
+        let collection = self.collection.clone();
         tokio::spawn(async move {
             if let Err(e) = ctx.store.ensure_schema().await {
                 let _ = tx.send(AppMsg::Ingest(IngestMsg::Aborted(format!("Weaviate is not reachable: {e:#}"))));
@@ -130,7 +153,7 @@ impl IngestScreen {
                 let txs = tx.clone();
                 let result = ctx
                     .pipeline
-                    .ingest_file_progress(path, &source, move |stage| {
+                    .ingest_file_progress(path, &source, &collection, move |stage| {
                         let _ = txs.send(AppMsg::Ingest(IngestMsg::Stage { idx, stage }));
                     })
                     .await
@@ -143,6 +166,19 @@ impl IngestScreen {
 
     pub fn on_msg(&mut self, msg: IngestMsg) {
         match msg {
+            IngestMsg::Collections(Ok(cols)) => {
+                let mut items = vec![];
+                let mut values = vec![];
+                for (name, chunks) in cols {
+                    let mark = if name == self.collection { "  ← current" } else { "" };
+                    items.push(format!("{name}  ({chunks} chunks){mark}"));
+                    values.push(Some(name));
+                }
+                items.push("＋ New collection…".to_string());
+                values.push(None);
+                self.picker = Some((Picker::new("Save into collection", items), values));
+            }
+            IngestMsg::Collections(Err(e)) => self.notice = Some(format!("Could not list collections: {e}")),
             IngestMsg::Started { idx } => {
                 if let Some(j) = self.jobs.get_mut(idx) {
                     j.started = Some(Instant::now());
@@ -221,7 +257,43 @@ impl Screen for IngestScreen {
         true
     }
 
+    fn popup_open(&self) -> bool {
+        self.picker.is_some()
+    }
+
     fn on_key(&mut self, key: KeyEvent, mode: Mode) -> bool {
+        if self.picker.is_some() {
+            let ev = self.picker.as_mut().map(|(p, _)| p.on_key(key)).unwrap_or(PickerEvent::None);
+            match ev {
+                PickerEvent::Chosen(idx) => {
+                    if let Some((_, values)) = self.picker.take() {
+                        match values.get(idx).cloned().flatten() {
+                            Some(name) => {
+                                self.notice = Some(format!("Saving into collection “{name}”."));
+                                self.collection = name;
+                            }
+                            None => {
+                                self.naming = true;
+                                self.notice = Some("Type the new collection name and press Enter.".into());
+                            }
+                        }
+                    }
+                }
+                PickerEvent::Cancel => self.picker = None,
+                PickerEvent::None => {}
+            }
+            return true;
+        }
+        let wants_picker = (mode == Mode::Input && key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k'))
+            || (mode == Mode::Nav && key.code == KeyCode::Char('k'));
+        if wants_picker {
+            let (ctx, tx) = (self.ctx.clone(), self.tx.clone());
+            tokio::spawn(async move {
+                let r = ctx.store.list_collections().await.map_err(|e| format!("{e:#}"));
+                let _ = tx.send(AppMsg::Ingest(IngestMsg::Collections(r)));
+            });
+            return true;
+        }
         if mode == Mode::Input {
             match self.input.on_key(key) {
                 InputEvent::Submit(t) => self.submit(t),
@@ -253,10 +325,20 @@ impl Screen for IngestScreen {
             Layout::vertical([Constraint::Length(3), Constraint::Length(3), Constraint::Min(3), Constraint::Length(1)]).areas(area);
 
         let typing = rc.focused && rc.mode == Mode::Input;
-        let ib = theme::pane(Line::from(Span::styled(" Ingest · path to a file or folder ", theme::bold(Color::White))), typing);
+        let title = if self.naming {
+            Line::from(Span::styled(" New collection name (Enter to confirm) ", theme::bold(Color::Magenta)))
+        } else {
+            Line::from(vec![
+                Span::styled(" Ingest ", theme::bold(Color::White)),
+                Span::styled("→ collection ", theme::dim()),
+                Span::styled(self.collection.clone(), theme::bold(Color::Magenta)),
+                Span::styled(" · Ctrl-K change · path below ", theme::dim()),
+            ])
+        };
+        let ib = theme::pane(title, typing);
         let iin = ib.inner(input_area);
         f.render_widget(ib, input_area);
-        self.input.render(f, iin, "/path/to/documents", typing);
+        self.input.render(f, iin, if self.naming { "e.g. legal, hr, contracts-2026" } else { "/path/to/documents" }, typing && self.picker.is_none());
 
         let (done, total) = (self.done_count(), self.jobs.len());
         let ratio = if total == 0 { 0.0 } else { done as f64 / total as f64 };
@@ -295,10 +377,16 @@ impl Screen for IngestScreen {
         }
     }
 
+    fn render_popup(&mut self, f: &mut Frame) {
+        if let Some((p, _)) = self.picker.as_mut() {
+            p.render(f);
+        }
+    }
+
     fn hints(&self, mode: Mode) -> &'static str {
         match mode {
-            Mode::Input => "Enter start · Tab complete path · ↑↓ history · Esc → navigate",
-            Mode::Nav => "i or Enter type path · x cancel run · c clear list · 1-5 screens · Tab pane · q quit",
+            Mode::Input => "Enter start · Ctrl-K collection · Tab complete path · ↑↓ history · Esc → navigate",
+            Mode::Nav => "i or Enter type path · k choose collection · x cancel run · c clear list · 1-5 screens · Tab pane · q quit",
         }
     }
 }

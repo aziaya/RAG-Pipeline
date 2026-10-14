@@ -22,11 +22,9 @@ pub async fn search(State(st): State<AppState>, Json(req): Json<SearchReq>) -> R
     if req.query.trim().is_empty() {
         return Err(ApiError::bad_request("empty query"));
     }
-    let hits = st
-        .ctx
-        .rag
-        .search(&req.query, req.limit.clamp(1, 50), req.alpha.clamp(0.0, 1.0), req.source.as_deref())
-        .await
-        .map_err(internal)?;
+    let mut base = st.ctx.cfg.retrieval_defaults();
+    base.top_k = 5; // /search has always defaulted to 5
+    let opts = req.params.apply(base);
+    let hits = st.ctx.rag.search(&req.query, &opts).await.map_err(internal)?;
     Ok(Json(hits))
 }

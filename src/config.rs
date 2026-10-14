@@ -1,3 +1,4 @@
+use crate::models::search::{RetrievalOptions, SearchMode};
 use anyhow::{Context, Result};
 use std::{env, path::PathBuf};
 
@@ -26,6 +27,19 @@ pub struct Config {
     pub chat_context_chars: usize,
     pub chat_disable_thinking: bool,
     pub chat_max_concurrent: usize,
+    pub chat_rewrite: bool,
+    pub chat_stream: bool,
+    pub chat_candidates: usize,
+    pub retrieval_mode: SearchMode,
+    pub retrieval_alpha: f32,
+    pub rerank_enabled: bool,
+    pub rerank_base_url: Option<String>,
+    pub rerank_model: String,
+    pub rerank_api_key: Option<String>,
+    pub rerank_weight: f32,
+    pub rerank_timeout_secs: u64,
+    pub data_dir: PathBuf,
+    pub default_collection: String,
 }
 
 fn var(name: &str, default: &str) -> String {
@@ -62,6 +76,36 @@ impl Config {
             chat_context_chars: var("CHAT_CONTEXT_CHARS", "9000").parse().context("CHAT_CONTEXT_CHARS")?,
             chat_disable_thinking: var("CHAT_DISABLE_THINKING", "true").parse().context("CHAT_DISABLE_THINKING")?,
             chat_max_concurrent: var("CHAT_MAX_CONCURRENT", "2").parse().context("CHAT_MAX_CONCURRENT")?,
+            chat_rewrite: var("CHAT_REWRITE", "true").parse().context("CHAT_REWRITE")?,
+            chat_stream: var("CHAT_STREAM", "true").parse().context("CHAT_STREAM")?,
+            chat_candidates: var("CHAT_CANDIDATES", "20").parse().context("CHAT_CANDIDATES")?,
+            retrieval_mode: var("RETRIEVAL_MODE", "hybrid").parse::<SearchMode>().map_err(anyhow::Error::msg).context("RETRIEVAL_MODE")?,
+            retrieval_alpha: var("RETRIEVAL_ALPHA", "0.5").parse().context("RETRIEVAL_ALPHA")?,
+            rerank_enabled: var("RERANK_ENABLED", "false").parse().context("RERANK_ENABLED")?,
+            rerank_base_url: opt("RERANK_BASE_URL").map(|u| u.trim_end_matches('/').to_string()),
+            rerank_model: var("RERANK_MODEL", "reranker"),
+            rerank_api_key: opt("RERANK_API_KEY"),
+            rerank_weight: var("RERANK_WEIGHT", "0.7").parse().context("RERANK_WEIGHT")?,
+            rerank_timeout_secs: var("RERANK_TIMEOUT_SECS", "30").parse().context("RERANK_TIMEOUT_SECS")?,
+            data_dir: PathBuf::from(var("DATA_DIR", "./data")),
+            default_collection: crate::models::collection::sanitize_collection(&var("DEFAULT_COLLECTION", "default"), "default"),
         })
+    }
+}
+
+impl Config {
+    /// Retrieval settings used until the user changes them.
+    pub fn retrieval_defaults(&self) -> RetrievalOptions {
+        RetrievalOptions {
+            mode: self.retrieval_mode,
+            alpha: self.retrieval_alpha,
+            top_k: self.chat_top_k,
+            rerank: self.rerank_enabled,
+            rerank_weight: self.rerank_weight,
+            candidates: self.chat_candidates,
+            source: None,
+            collections: vec![],
+        }
+        .sanitized()
     }
 }

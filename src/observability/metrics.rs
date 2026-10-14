@@ -60,7 +60,18 @@ pub struct LatencyRow {
 }
 
 /// Order in which operations are shown.
-const OPS: [&str; 6] = ["extract", "embed_batch", "weaviate_query", "weaviate_write", "search", "llm_generate"];
+const OPS: [&str; 10] = [
+    "extract",
+    "embed_batch",
+    "weaviate_query",
+    "weaviate_write",
+    "search",
+    "rerank",
+    "rewrite_query",
+    "first_token",
+    "llm_generate",
+    "summarize_memory",
+];
 
 impl Metrics {
     pub fn inc(&self, counter: &AtomicU64, by: u64) {

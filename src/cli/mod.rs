@@ -29,8 +29,13 @@ pub enum Command {
     Tui,
     /// Prompt-and-menu terminal UI (single pane)
     Classic,
-    /// Ingest a file or a folder, with progress
-    Ingest { path: PathBuf },
+    /// Ingest a file or a folder into a collection, with progress
+    Ingest {
+        path: PathBuf,
+        /// Collection to save into (default: DEFAULT_COLLECTION)
+        #[arg(short, long)]
+        collection: Option<String>,
+    },
     /// Hybrid search, printed as JSON
     Search {
         query: String,
@@ -39,6 +44,9 @@ pub enum Command {
         /// 0 = keyword only, 1 = vector only
         #[arg(short, long, default_value_t = 0.5)]
         alpha: f32,
+        /// Search only these collections (comma separated; default: all)
+        #[arg(short, long, value_delimiter = ',')]
+        collection: Vec<String>,
     },
     /// Chat with your documents: `chat "question"` answers once, plain `chat` is interactive
     Chat {
@@ -53,6 +61,9 @@ pub enum Command {
         /// Only search this ingested file
         #[arg(short, long)]
         source: Option<String>,
+        /// Search only these collections (comma separated; default: all)
+        #[arg(short, long, value_delimiter = ',')]
+        collection: Vec<String>,
     },
     /// Run the HTTP API (POST /ingest, /search, /chat; Swagger UI at /docs)
     Serve,
@@ -78,6 +89,11 @@ impl Cli {
     }
 }
 
+/// Normalise collection names typed on the command line.
+fn names(raw: &[String]) -> Vec<String> {
+    raw.iter().map(|n| crate::models::collection::sanitize_collection(n, "")).filter(|n| !n.is_empty()).collect()
+}
+
 pub async fn run(cli: Cli, ctx: AppContext, trace_rx: Option<UnboundedReceiver<TraceEvent>>) -> Result<()> {
     use std::io::IsTerminal;
     let is_tty = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
@@ -87,16 +103,16 @@ pub async fn run(cli: Cli, ctx: AppContext, trace_rx: Option<UnboundedReceiver<T
             crate::tui::run(ctx, rx).await
         }
         Some(Command::Classic) => classic::run_menu(&ctx).await,
-        Some(Command::Ingest { path }) => commands::ingest(&ctx, &path).await,
-        Some(Command::Search { query, limit, alpha }) => commands::search(&ctx, &query, limit, alpha).await,
-        Some(Command::Chat { question, limit, alpha, source }) => {
+        Some(Command::Ingest { path, collection }) => commands::ingest(&ctx, &path, collection).await,
+        Some(Command::Search { query, limit, alpha, collection }) => commands::search(&ctx, &query, limit, alpha, collection).await,
+        Some(Command::Chat { question, limit, alpha, source, collection }) => {
             let limit = limit.unwrap_or(ctx.cfg.chat_top_k).clamp(1, 20);
             let alpha = alpha.clamp(0.0, 1.0);
             if question.is_none() && is_tty {
-                classic::chat_session(&ctx, classic::ChatOpts { limit, alpha, source }).await
+                classic::chat_session(&ctx, classic::ChatOpts { limit, alpha, source, collections: names(&collection) }).await
             } else {
                 // One-shot questions and piped input use the plain, script-friendly mode.
-                plain_chat::run(&ctx, question, plain_chat::Opts { limit, alpha, source }).await
+                plain_chat::run(&ctx, question, plain_chat::Opts { limit, alpha, source, collections: names(&collection) }).await
             }
         }
         Some(Command::Serve) => commands::serve(ctx).await,

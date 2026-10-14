@@ -13,8 +13,11 @@ use super::{
 };
 use crate::{
     context::AppContext,
-    models::{health::Check, search::Hit},
-    util::short,
+    models::{
+        collection::{ChunkPage, DocumentInfo},
+        health::Check,
+        search::Hit,
+    },
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::time::{Duration, Instant};
@@ -73,10 +76,12 @@ pub enum AppMsg {
     Chat(ChatMsg),
     Ingest(IngestMsg),
     Search(Result<Vec<Hit>, String>),
-    Docs(Result<Vec<(String, usize)>, String>),
+    Docs(Result<Vec<DocumentInfo>, String>),
+    Chunks(Result<ChunkPage, String>),
+    SearchCollections(Result<Vec<(String, usize)>, String>),
     DocDeleted(Result<String, String>),
     Status(Vec<Check>),
-    ChatAbout(String),
+    ChatAbout { collection: String, source: String },
 }
 
 pub struct App {
@@ -178,14 +183,16 @@ impl App {
             AppMsg::Ingest(m) => self.ingest.on_msg(m),
             AppMsg::Search(r) => self.search.on_msg(r),
             AppMsg::Docs(r) => self.docs.on_docs(r),
-            AppMsg::DocDeleted(Ok(name)) => {
-                self.notify(format!("Deleted {}", short(&name)));
+            AppMsg::Chunks(r) => self.docs.on_chunks(r),
+            AppMsg::SearchCollections(r) => self.search.on_collections(r),
+            AppMsg::DocDeleted(Ok(label)) => {
+                self.notify(format!("Deleted {label}"));
                 self.docs.refresh();
             }
             AppMsg::DocDeleted(Err(e)) => self.notify(format!("Delete failed: {e}")),
             AppMsg::Status(c) => self.status.on_checks(c),
-            AppMsg::ChatAbout(src) => {
-                self.chat.set_source(Some(src));
+            AppMsg::ChatAbout { collection, source } => {
+                self.chat.set_scope(vec![collection], Some(source));
                 self.goto(ScreenId::Chat);
             }
         }

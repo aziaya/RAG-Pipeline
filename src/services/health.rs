@@ -16,11 +16,19 @@ async fn limited<T>(f: impl Future<Output = Result<T>>) -> Result<T> {
 
 pub async fn run_checks(ctx: &AppContext) -> Vec<Check> {
     let cfg = &ctx.cfg;
-    let (weaviate, docs, embed, llm) = tokio::join!(
+    let rerank_probe = async {
+        if ctx.reranker.configured() {
+            Some(limited(ctx.reranker.probe()).await)
+        } else {
+            None
+        }
+    };
+    let (weaviate, docs, embed, llm, rerank) = tokio::join!(
         limited(ctx.store.is_ready()),
-        limited(ctx.store.list_sources()),
+        limited(ctx.store.list_documents(None)),
         limited(ctx.embedder.probe()),
         limited(ctx.llm.probe()),
+        rerank_probe,
     );
 
     let mut out = Vec::new();
@@ -30,8 +38,10 @@ pub async fn run_checks(ctx: &AppContext) -> Vec<Check> {
     }
     if weaviate.is_ok() {
         if let Ok(d) = docs {
-            let chunks: usize = d.iter().map(|x| x.1).sum();
-            out.push(Check { name: "Index", level: Level::Ok, detail: format!("{} documents, {chunks} chunks", d.len()) });
+            let chunks: usize = d.iter().map(|x| x.chunks).sum();
+            let mut cols: Vec<&str> = d.iter().map(|x| x.collection.as_str()).collect();
+            cols.dedup();
+            out.push(Check { name: "Index", level: Level::Ok, detail: format!("{} documents in {} collections, {chunks} chunks", d.len(), cols.len()) });
         }
     }
     match embed {
@@ -45,6 +55,20 @@ pub async fn run_checks(ctx: &AppContext) -> Vec<Check> {
     match llm {
         Ok(m) => out.push(Check { name: "Chat model", level: Level::Ok, detail: format!("{m} · {}", cfg.chat_base_url) }),
         Err(e) => out.push(Check { name: "Chat model", level: Level::Fail, detail: format!("{} — {e:#}", cfg.chat_base_url) }),
+    }
+    match rerank {
+        Some(Ok(m)) => out.push(Check {
+            name: "Reranker",
+            level: Level::Ok,
+            detail: format!("{m} · {} · {}", ctx.reranker.endpoint().unwrap_or(""), if cfg.rerank_enabled { "on by default" } else { "off by default" }),
+        }),
+        Some(Err(e)) => out.push(Check { name: "Reranker", level: Level::Fail, detail: format!("{} — {e:#}", ctx.reranker.endpoint().unwrap_or("")) }),
+        None if cfg.rerank_enabled => out.push(Check {
+            name: "Reranker",
+            level: Level::Warn,
+            detail: "RERANK_ENABLED=true but RERANK_BASE_URL is not set".into(),
+        }),
+        None => out.push(Check { name: "Reranker", level: Level::Ok, detail: "off (set RERANK_BASE_URL to enable reranking)".into() }),
     }
     match std::fs::metadata(&cfg.chunk_tokenizer) {
         Ok(m) if m.len() > 1_000_000 => out.push(Check {

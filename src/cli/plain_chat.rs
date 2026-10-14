@@ -1,7 +1,10 @@
 //! Plain-text chat: one-shot (`chat "question"`) or a simple line-by-line loop.
 //! Script- and pipe-friendly; no colors, no screen control.
 
-use crate::{context::AppContext, models::chat::ChatTurn};
+use crate::{
+    context::AppContext,
+    models::chat::{ChatMemory, ChatTurn, RagStage},
+};
 use anyhow::Result;
 use std::io::Write;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -10,14 +13,55 @@ pub struct Opts {
     pub limit: usize,
     pub alpha: f32,
     pub source: Option<String>,
+    pub collections: Vec<String>,
 }
 
 const HELP: &str = "Commands:\n  /source <file>  only search this ingested file\n  /source         clear the file filter\n  /clear          forget the conversation so far\n  /help           show this help\n  /exit           quit (Ctrl-D also works)";
 
 async fn ask(ctx: &AppContext, question: &str, history: &[ChatTurn], o: &Opts) -> Result<String> {
     eprintln!("(searching and thinking, this can take a while on CPU...)");
-    let ans = ctx.rag.answer(question, history, o.limit, o.alpha, o.source.as_deref(), |_| {}).await?;
-    println!("\n{}\n", ans.answer);
+    let mut opts = ctx.cfg.retrieval_defaults();
+    opts.top_k = o.limit;
+    opts.alpha = o.alpha;
+    opts.source = o.source.clone();
+    opts.collections = o.collections.clone();
+    let memory = ChatMemory { summary: None, turns: history.to_vec() };
+    let opts = opts.sanitized();
+    let ans = if ctx.cfg.chat_stream {
+        let streamed = std::cell::Cell::new(false);
+        let ans = ctx
+            .rag
+            .answer_stream(
+                question,
+                &memory,
+                &opts,
+                ctx.cfg.chat_rewrite,
+                |stage| {
+                    if let RagStage::Generating { .. } = stage {
+                        println!();
+                    }
+                },
+                |tok| {
+                    streamed.set(true);
+                    print!("{tok}");
+                    let _ = std::io::stdout().flush();
+                    true
+                },
+            )
+            .await?;
+        if !streamed.get() {
+            print!("{}", ans.answer); // nothing was generated (e.g. no passages found)
+        }
+        println!("\n");
+        ans
+    } else {
+        let ans = ctx.rag.answer(question, &memory, &opts, ctx.cfg.chat_rewrite, |_| {}).await?;
+        println!("\n{}\n", ans.answer);
+        ans
+    };
+    if let Some(q) = &ans.searched_for {
+        eprintln!("(searched for: {q})");
+    }
     if !ans.sources.is_empty() {
         println!("Sources:");
         for s in &ans.sources {

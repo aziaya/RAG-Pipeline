@@ -23,16 +23,17 @@ impl Pipeline {
         Self { cfg, embedder, store }
     }
 
-    /// Ingest one file. `source` is the stable identity of the document (path or filename).
+    /// Ingest one file into `collection`. `source` is the stable identity of the document (path or
+    /// filename); a document is identified by `(collection, source)`.
     /// Idempotent: unchanged content is skipped, changed content replaces the old chunks.
-    pub async fn ingest_file(&self, path: &Path, source: &str) -> Result<IngestOutcome> {
-        self.ingest_file_progress(path, source, |_| {}).await
+    pub async fn ingest_file(&self, path: &Path, source: &str, collection: &str) -> Result<IngestOutcome> {
+        self.ingest_file_progress(path, source, collection, |_| {}).await
     }
 
     /// Same as `ingest_file`, reporting each stage to `on_stage` (used by the terminal UIs).
-    pub async fn ingest_file_progress(&self, path: &Path, source: &str, on_stage: impl Fn(Stage)) -> Result<IngestOutcome> {
-        let span = info_span!("ingest_file", file = %short(source));
-        let res = self.ingest_inner(path, source, on_stage).instrument(span.clone()).await;
+    pub async fn ingest_file_progress(&self, path: &Path, source: &str, collection: &str, on_stage: impl Fn(Stage)) -> Result<IngestOutcome> {
+        let span = info_span!("ingest_file", file = %short(source), collection = %collection);
+        let res = self.ingest_inner(path, source, collection, on_stage).instrument(span.clone()).await;
         let m = metrics();
         match &res {
             Ok(IngestOutcome::Indexed { chunks, .. }) => {
@@ -50,14 +51,14 @@ impl Pipeline {
         res
     }
 
-    async fn ingest_inner(&self, path: &Path, source: &str, on_stage: impl Fn(Stage)) -> Result<IngestOutcome> {
+    async fn ingest_inner(&self, path: &Path, source: &str, collection: &str, on_stage: impl Fn(Stage)) -> Result<IngestOutcome> {
         on_stage(Stage::Checking);
         let bytes = tokio::fs::read(path).await.with_context(|| format!("read {}", path.display()))?;
         let doc_hash = sha256_hex(&bytes);
         debug!(bytes = bytes.len(), hash = %&doc_hash[..12], "file hashed");
         drop(bytes);
 
-        if self.store.is_current(source, &doc_hash).await? {
+        if self.store.is_current(collection, source, &doc_hash).await? {
             info!("unchanged since last ingest, skipping");
             return Ok(IngestOutcome::Skipped { source: source.to_string() });
         }
@@ -97,8 +98,8 @@ impl Pipeline {
         on_stage(Stage::Indexing);
         let n = chunks.len();
         let written = async {
-            self.store.delete_source(source).await?;
-            self.store.insert_chunks(source, &doc_hash, self.embedder.model(), chunks).await
+            self.store.delete_source(collection, source).await?;
+            self.store.insert_chunks(collection, source, &doc_hash, self.embedder.model(), chunks).await
         }
         .instrument(info_span!("weaviate_write", chunks = n))
         .await?;

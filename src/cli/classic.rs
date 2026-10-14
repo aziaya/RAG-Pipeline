@@ -4,7 +4,8 @@
 use crate::{
     context::AppContext,
     models::{
-        chat::{ChatTurn, RagStage, SourceRef},
+        collection::sanitize_collection,
+        chat::{ChatMemory, ChatTurn, RagStage, SourceRef},
         document::{IngestOutcome, Stage},
         health::Level,
         search::Hit,
@@ -27,6 +28,8 @@ pub struct ChatOpts {
     pub limit: usize,
     pub alpha: f32,
     pub source: Option<String>,
+    /// Collections to search; empty means all
+    pub collections: Vec<String>,
 }
 
 // ───────────────────────────── small helpers ─────────────────────────────
@@ -144,7 +147,7 @@ pub async fn run_menu(ctx: &AppContext) -> Result<()> {
             .interact_opt()?;
         let result = match choice {
             Some(0) => {
-                chat_session(ctx, ChatOpts { limit: p.cfg.chat_top_k, alpha: 0.5, source: None }).await
+                chat_session(ctx, ChatOpts { limit: p.cfg.chat_top_k, alpha: 0.5, source: None, collections: vec![] }).await
             }
             Some(1) => search_flow(ctx).await,
             Some(2) => ingest_flow(p).await,
@@ -170,6 +173,13 @@ pub async fn run_menu(ctx: &AppContext) -> Result<()> {
 
 async fn ingest_flow(p: &Pipeline) -> Result<()> {
     let th = theme();
+    let default = p.cfg.default_collection.clone();
+    let typed: String = Input::with_theme(&th)
+        .with_prompt("Collection to save into (Enter for the default)")
+        .default(default.clone())
+        .interact_text()?;
+    let collection = sanitize_collection(&typed, &default);
+    println!("{}", style(format!("Saving into collection “{collection}”")).dim());
     let raw: String = Input::with_theme(&th)
         .with_prompt("Path to a file or folder (Tab completes, drag & drop works)")
         .completion_with(&PathCompletion)
@@ -224,7 +234,7 @@ async fn ingest_flow(p: &Pipeline) -> Result<()> {
             _ => return Ok(()),
         }
     }
-    ingest_paths(p, files).await
+    ingest_paths(p, files, &collection).await
 }
 
 fn stage_text(name: &str, s: &Stage) -> String {
@@ -246,7 +256,7 @@ fn stage_text(name: &str, s: &Stage) -> String {
 
 /// Ingest files one after another with an overall progress bar and a live stage line,
 /// then print a summary table. Used by the menu and by `rag-pipeline ingest`.
-pub async fn ingest_paths(p: &Pipeline, files: Vec<PathBuf>) -> Result<()> {
+pub async fn ingest_paths(p: &Pipeline, files: Vec<PathBuf>, collection: &str) -> Result<()> {
     p.store.ensure_schema().await?;
     let mp = MultiProgress::new();
     let overall = mp.add(ProgressBar::new(files.len() as u64));
@@ -255,7 +265,7 @@ pub async fn ingest_paths(p: &Pipeline, files: Vec<PathBuf>) -> Result<()> {
             .unwrap()
             .progress_chars("█▓░"),
     );
-    overall.set_prefix("Ingesting");
+    overall.set_prefix(format!("Ingesting → {collection}"));
     let stage = mp.add(ProgressBar::new_spinner());
     stage.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
     stage.enable_steady_tick(Duration::from_millis(90));
@@ -267,7 +277,7 @@ pub async fn ingest_paths(p: &Pipeline, files: Vec<PathBuf>) -> Result<()> {
         stage.set_message(stage_text(&name, &Stage::Checking));
         let started = Instant::now();
         let res = p
-            .ingest_file_progress(f, &source, |s| stage.set_message(stage_text(&name, &s)))
+            .ingest_file_progress(f, &source, collection, |s| stage.set_message(stage_text(&name, &s)))
             .await
             .map_err(|e| format!("{e:#}"));
         rows.push((name, res, started.elapsed()));
@@ -345,7 +355,7 @@ async fn search_flow(ctx: &AppContext) -> Result<()> {
             return Ok(());
         }
         let sp = spinner("Embedding the query and searching Weaviate…");
-        let res = ctx.rag.search(q.trim(), 8, alpha, None).await;
+        let res = ctx.rag.search(q.trim(), &{ let mut o = ctx.cfg.retrieval_defaults(); o.top_k = 8; o.alpha = alpha; o.sanitized() }).await;
         sp.finish_and_clear();
         let hits = res?;
         if hits.is_empty() {
@@ -385,15 +395,17 @@ struct Session {
     limit: usize,
     alpha: f32,
     source: Option<String>,
+    collections: Vec<String>,
     sources: Vec<SourceRef>,
 }
 
-const CHAT_HELP: &str = "  /source        pick a document to search within (or all)\n  /show N        read source N in full\n  /alpha 0-1     0 = keywords only, 1 = meaning only\n  /limit N       passages retrieved per question\n  /clear         forget this conversation\n  /exit          back to the menu";
+const CHAT_HELP: &str = "  /source        pick a document to search within (or all)\n  /collection a,b  search only these collections (no argument = all)\n  /show N        read source N in full\n  /alpha 0-1     0 = keywords only, 1 = meaning only\n  /limit N       passages retrieved per question\n  /clear         forget this conversation\n  /exit          back to the menu";
 
 fn chat_header(s: &Session) {
-    let scope = match &s.source {
-        Some(f) => format!("document: {}", short(f)),
-        None => "all documents".to_string(),
+    let scope = match (&s.source, s.collections.is_empty()) {
+        (Some(f), _) => format!("document: {}", short(f)),
+        (None, false) => format!("collections: {}", s.collections.join(", ")),
+        (None, true) => "all collections".to_string(),
     };
     println!(
         "{}  {}",
@@ -414,7 +426,7 @@ fn print_source(s: &SourceRef, sk: &MadSkin) {
 pub async fn chat_session(ctx: &AppContext, opts: ChatOpts) -> Result<()> {
     let th = theme();
     let sk = skin();
-    let mut s = Session { history: vec![], limit: opts.limit, alpha: opts.alpha, source: opts.source, sources: vec![] };
+    let mut s = Session { history: vec![], limit: opts.limit, alpha: opts.alpha, source: opts.source, collections: opts.collections, sources: vec![] };
     let mut hist = BasicHistory::new().max_entries(100).no_duplicates(true);
     println!();
     chat_header(&s);
@@ -457,13 +469,18 @@ pub async fn chat_session(ctx: &AppContext, opts: ChatOpts) -> Result<()> {
                     Some(src) => print_source(src, &sk),
                     None => println!("Usage: /show N (a source number from the last answer)"),
                 },
+                "collection" => {
+                    s.collections = arg.split(',').map(|n| sanitize_collection(n, "")).filter(|n| !n.is_empty()).collect();
+                    s.source = None;
+                    chat_header(&s);
+                }
                 "source" => {
-                    let docs = ctx.store.list_sources().await?;
+                    let docs = ctx.store.list_documents(None).await?;
                     if docs.is_empty() {
                         println!("{}", style("No documents ingested yet.").yellow());
                     } else {
                         let mut items = vec!["All documents".to_string()];
-                        items.extend(docs.iter().map(|(n, c)| format!("{}  ({c} chunks)", short(n))));
+                        items.extend(docs.iter().map(|d| format!("{} / {}  ({} chunks)", d.collection, short(&d.source), d.chunks)));
                         let sel = FuzzySelect::with_theme(&th)
                             .with_prompt("Search within (type to filter, Esc to cancel)")
                             .items(&items)
@@ -471,7 +488,10 @@ pub async fn chat_session(ctx: &AppContext, opts: ChatOpts) -> Result<()> {
                             .interact_opt()?;
                         match sel {
                             Some(0) => s.source = None,
-                            Some(i) => s.source = Some(docs[i - 1].0.clone()),
+                            Some(i) => {
+                                s.source = Some(docs[i - 1].source.clone());
+                                s.collections = vec![docs[i - 1].collection.clone()];
+                            }
                             None => {}
                         }
                         chat_header(&s);
@@ -492,10 +512,18 @@ async fn ask(ctx: &AppContext, s: &mut Session, q: &str, sk: &MadSkin) -> Result
     let started = Instant::now();
     let sp = spinner("Searching your documents…");
     let sp2 = sp.clone();
+    let memory = ChatMemory { summary: None, turns: s.history.clone() };
+    let mut opts = ctx.cfg.retrieval_defaults();
+    opts.top_k = s.limit;
+    opts.alpha = s.alpha;
+    opts.source = s.source.clone();
+    opts.collections = s.collections.clone();
     let res = ctx
         .rag
-        .answer(q, &s.history, s.limit, s.alpha, s.source.as_deref(), move |stage| match stage {
+        .answer(q, &memory, &opts.sanitized(), ctx.cfg.chat_rewrite, move |stage| match stage {
+            RagStage::Rewriting => sp2.set_message("Understanding your follow-up…"),
             RagStage::Searching => sp2.set_message("Searching your documents…"),
+            RagStage::Reranking { candidates } => sp2.set_message(format!("Reranking {candidates} candidates…")),
             RagStage::Generating { passages } => sp2.set_message(format!("Reading {passages} passages and writing an answer…")),
         })
         .await;
@@ -537,22 +565,22 @@ async fn browse_flow(ctx: &AppContext) -> Result<()> {
     let th = theme();
     loop {
         let sp = spinner("Loading documents from Weaviate…");
-        let docs = p.store.list_sources().await;
+        let docs = p.store.list_documents(None).await;
         sp.finish_and_clear();
         let docs = docs?;
         if docs.is_empty() {
             println!("{}", style("Nothing ingested yet. Use “Ingest files or a folder”.").yellow());
             return Ok(());
         }
-        let total: usize = docs.iter().map(|d| d.1).sum();
-        let mut t = new_table(&["#", "Document", "Chunks"]);
-        for (i, (name, n)) in docs.iter().enumerate() {
-            t.add_row(vec![Cell::new(i + 1).fg(Color::Yellow), Cell::new(short(name)), Cell::new(n)]);
+        let total: usize = docs.iter().map(|d| d.chunks).sum();
+        let mut t = new_table(&["#", "Collection", "Document", "Chunks"]);
+        for (i, d) in docs.iter().enumerate() {
+            t.add_row(vec![Cell::new(i + 1).fg(Color::Yellow), Cell::new(&d.collection).fg(Color::Magenta), Cell::new(short(&d.source)), Cell::new(d.chunks)]);
         }
         println!("{t}");
         println!("{} documents, {} chunks\n", style(docs.len()).bold(), style(total).bold());
 
-        let mut items: Vec<String> = docs.iter().map(|(n, c)| format!("{}  ({c} chunks)", n)).collect();
+        let mut items: Vec<String> = docs.iter().map(|d| format!("{} / {}  ({} chunks)", d.collection, d.source, d.chunks)).collect();
         items.push("Back to menu".into());
         let pick = FuzzySelect::with_theme(&th)
             .with_prompt("Select a document (type to filter, Esc to go back)")
@@ -560,7 +588,7 @@ async fn browse_flow(ctx: &AppContext) -> Result<()> {
             .default(0)
             .interact_opt()?;
         let Some(i) = pick.filter(|i| *i < docs.len()) else { return Ok(()) };
-        let (source, _) = docs[i].clone();
+        let (collection, source) = (docs[i].collection.clone(), docs[i].source.clone());
 
         let action = Select::with_theme(&th)
             .with_prompt(format!("{}", short(&source)))
@@ -569,7 +597,7 @@ async fn browse_flow(ctx: &AppContext) -> Result<()> {
             .interact_opt()?;
         match action {
             Some(0) => {
-                return chat_session(ctx, ChatOpts { limit: p.cfg.chat_top_k, alpha: 0.5, source: Some(source) }).await;
+                return chat_session(ctx, ChatOpts { limit: p.cfg.chat_top_k, alpha: 0.5, source: Some(source), collections: vec![collection] }).await;
             }
             Some(1) => {
                 let sure = Confirm::with_theme(&th)
@@ -578,7 +606,7 @@ async fn browse_flow(ctx: &AppContext) -> Result<()> {
                     .interact()?;
                 if sure {
                     let sp = spinner("Deleting…");
-                    let r = p.store.delete_source(&source).await;
+                    let r = p.store.delete_source(&collection, &source).await;
                     sp.finish_and_clear();
                     r?;
                     println!("{} deleted {}", style("✔").green(), short(&source));
